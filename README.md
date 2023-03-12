@@ -19,7 +19,7 @@
 > -listen string
 > 		http监听地址 (default "0.0.0.0:9999")
 > -promes string
-> 		prometheus地址，使用,分割 (default "http://localhost:9090/api/v1/write")
+> 		prometheus地址，多台使用 `,` 逗号分割 (default "http://localhost:9090/api/v1/write")
 > -hash_algorithm string                     
 >         一致性哈希算法 (default "murmur3")
 > -remote_path string

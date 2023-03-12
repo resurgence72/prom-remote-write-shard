@@ -49,7 +49,7 @@ var (
 )
 
 func initFlag() {
-	flag.StringVar(&promes, "promes", "http://localhost:9090/api/v1/write", "prometheus地址，使用,分割")
+	flag.StringVar(&promes, "promes", "http://localhost:9090/api/v1/write", "prometheus地址，多台使用 `,` 逗号分割")
 	flag.StringVar(&shardKey, "shard_key", "series", "根据什么来分片,metric/series")
 	flag.StringVar(&addr, "listen", "0.0.0.0:9999", "http监听地址")
 	flag.StringVar(&remotePath, "remote_path", "/api/v1/write", "http remote路径")
