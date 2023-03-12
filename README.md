@@ -43,5 +43,6 @@
 > -shard_key series
 > 
 > 
-> # 运行后修改监控系统的remote write 地址即可实现分片效果，例如修改 categraf,prometheus,夜莺等监控系统的 remote_write 配置
+> # 运行后修改监控系统的remote write 地址即可实现分片效果；
+> # 例如修改 categraf,prometheus,夜莺等监控系统的 remote_write 配置为  http://0.0.0.0:9999/api/v1/write  即 http://${listen}/${remote_path}
 > ```
