@@ -174,10 +174,7 @@ func consumer(ctx context.Context, i int, r *remote) {
 
 		// copy
 		c := make([]prompb.TimeSeries, 0, len(container))
-		for _, series := range container {
-			series := series
-			c = append(c, *series)
-		}
+		copy(c, container)
 
 		// re-slice
 		container = container[:0]
