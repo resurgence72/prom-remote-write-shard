@@ -85,9 +85,9 @@ func main() {
 	var ch *pkg.Map
 	switch hashAlgorithm {
 	case MURMUR3Hash:
-		ch = pkg.New(500, nil)
+		ch = pkg.New()
 	case CRC323Hash:
-		ch = pkg.New(500, crc32.ChecksumIEEE)
+		ch = pkg.New(pkg.WithCRC32Hash(crc32.ChecksumIEEE))
 	default:
 		logrus.Fatalln("hash algorithm not support, only support murmur3 and crc32 algorithm")
 	}

@@ -10,6 +10,20 @@ import (
 
 type Hash func(data []byte) uint32
 
+type Option func(*Map)
+
+func WithReplicas(replicas int) Option {
+	return func(m *Map) {
+		m.replicas = replicas
+	}
+}
+
+func WithCRC32Hash(h Hash) Option {
+	return func(m *Map) {
+		m.hash = h
+	}
+}
+
 const defaultReplicas = 500
 
 type Map struct {
@@ -22,11 +36,13 @@ type Map struct {
 }
 
 // 初始化ring
-func New(replicas int, fn Hash) *Map {
+func New(opts ...Option) *Map {
 	m := &Map{
-		hash:     fn,
-		replicas: replicas,
-		hashMap:  make(map[int]string),
+		hashMap: make(map[int]string),
+	}
+
+	for _, opt := range opts {
+		opt(m)
 	}
 
 	if m.hash == nil {
