@@ -204,7 +204,7 @@ func consumer(ctx context.Context, i int, r *remote) {
 		case series := <-r.seriesCh:
 			container = append(container, series)
 
-			if len(container) == batch {
+			if len(container) == cap(container) {
 				report()
 			}
 		}
