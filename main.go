@@ -4,20 +4,22 @@ import (
 	"bytes"
 	"context"
 	"flag"
-	"github.com/gogo/protobuf/proto"
-	"github.com/golang/snappy"
-	"github.com/prometheus/client_golang/api"
-	"github.com/prometheus/prometheus/prompb"
-	"github.com/sirupsen/logrus"
 	"hash/crc32"
 	"io"
 	"net"
 	"net/http"
 	"os"
-	"prom-remote-write-shard/pkg"
 	"sort"
 	"strings"
 	"time"
+
+	"prom-remote-write-shard/pkg"
+
+	"github.com/gogo/protobuf/proto"
+	"github.com/golang/snappy"
+	"github.com/prometheus/client_golang/api"
+	"github.com/prometheus/prometheus/prompb"
+	"github.com/sirupsen/logrus"
 )
 
 const (

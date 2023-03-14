@@ -1,10 +1,11 @@
 package pkg
 
 import (
-	"github.com/spaolacci/murmur3"
 	"sort"
 	"strconv"
 	"sync"
+
+	"github.com/spaolacci/murmur3"
 )
 
 type Hash func(data []byte) uint32
