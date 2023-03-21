@@ -11,6 +11,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"prom-remote-write-shard/pkg"
@@ -48,6 +49,11 @@ var (
 
 	h bool
 	v bool
+
+	bufPool = &pkg.ByteBufferPool{}
+	tsPool  = sync.Pool{New: func() any {
+		return make([]prompb.TimeSeries, 0)
+	}}
 )
 
 func initFlag() {
@@ -119,20 +125,35 @@ func main() {
 		go consumer(ctx, i, r)
 	}
 
+	read := func(r *http.Request, bb *pkg.ByteBuffer) error {
+		if _, err := bb.ReadFrom(r.Body); err != nil {
+			return err
+		} else {
+			return nil
+		}
+	}
+
 	http.HandleFunc(remotePath, func(w http.ResponseWriter, r *http.Request) {
-		compressed, err := io.ReadAll(r.Body)
-		if err != nil {
+		readBuf := bufPool.Get()
+		defer bufPool.Put(readBuf)
+
+		if err := read(r, readBuf); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		reqBuf, err := snappy.Decode(nil, compressed)
+
+		bb := bufPool.Get()
+		defer bufPool.Put(bb)
+
+		var err error
+		bb.B, err = snappy.Decode(bb.B[:cap(bb.B)], readBuf.B)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
 		var req prompb.WriteRequest
-		if err := proto.Unmarshal(reqBuf, &req); err != nil {
+		if err := proto.Unmarshal(bb.B, &req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -174,8 +195,10 @@ func consumer(ctx context.Context, i int, r *remote) {
 			return
 		}
 
+		c := tsPool.Get().([]prompb.TimeSeries)
+		defer tsPool.Put(c)
+
 		// copy
-		c := make([]prompb.TimeSeries, 0, len(container))
 		for _, series := range container {
 			series := series
 			c = append(c, *series)
@@ -188,6 +211,10 @@ func consumer(ctx context.Context, i int, r *remote) {
 		req := &prompb.WriteRequest{
 			Timeseries: c,
 		}
+
+		bb := bufPool.Get()
+		defer bufPool.Put(bb)
+
 		marshal, err := proto.Marshal(req)
 		if err != nil {
 			logrus.Errorln("send series proto marshal failed", err)
@@ -195,7 +222,7 @@ func consumer(ctx context.Context, i int, r *remote) {
 		}
 
 		// remote send
-		go send(r, snappy.Encode(nil, marshal))
+		go send(r, snappy.Encode(bb.B[:cap(bb.B)], marshal))
 	}
 
 	for {
