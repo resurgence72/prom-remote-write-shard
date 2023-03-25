@@ -46,3 +46,7 @@
 > # 运行后修改监控系统的remote write 地址即可实现分片效果；
 > # 例如修改 categraf,prometheus,夜莺等监控系统的 remote_write 配置为  http://0.0.0.0:9999/api/v1/write  即 http://${listen}/${remote_path}
 > ```
+
+
+#### 自监控
+> 项目提供 /metrics 接口供 prometheus 抓取；暴漏 prom_rw_shard_series_drop_counter 指标，标识当前 chan 写满之后 drop 的 series 数量，衡量压力

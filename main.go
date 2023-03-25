@@ -19,6 +19,8 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 	"github.com/prometheus/client_golang/api"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/sirupsen/logrus"
 )
@@ -40,6 +42,7 @@ type remote struct {
 }
 
 var (
+	// flag section
 	promes        string
 	shardKey      string
 	addr          string
@@ -50,10 +53,17 @@ var (
 	h bool
 	v bool
 
+	// pool section
 	bufPool = &pkg.ByteBufferPool{}
 	tsPool  = sync.Pool{New: func() any {
 		return make([]prompb.TimeSeries, 0)
 	}}
+
+	// prometheus section
+	promRWShardSeriesDropCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "prom_rw_shard_series_drop_counter",
+		Help: "prom rw shard series drop counter",
+	})
 )
 
 func initFlag() {
@@ -86,7 +96,8 @@ func main() {
 		logrus.Fatalln("promes can not be empty")
 	}
 
-	ps := strings.Split(promes, ",")
+	// register prom metrics
+	prometheus.Register(promRWShardSeriesDropCounter)
 
 	var ch *pkg.Map
 	switch hashAlgorithm {
@@ -98,13 +109,13 @@ func main() {
 		logrus.Fatalln("hash algorithm not support, only support murmur3 and crc32 algorithm")
 	}
 
+	ps := strings.Split(promes, ",")
 	ch.Adds(ps...)
 
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
 
 	remoteSet := make(map[string]*remote, len(ps))
-
 	for i, prom := range ps {
 		client, _ := api.NewClient(api.Config{
 			Address: prom,
@@ -133,6 +144,7 @@ func main() {
 		}
 	}
 
+	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc(remotePath, func(w http.ResponseWriter, r *http.Request) {
 		readBuf := bufPool.Get()
 		defer bufPool.Put(readBuf)
@@ -160,9 +172,9 @@ func main() {
 
 		for _, ts := range req.Timeseries {
 			ts := ts
-			var kv []string
 
 			lbs := ts.Labels
+			kv := make([]string, 0, len(lbs))
 			switch shardKey {
 			case SeriesShardKey:
 				for _, label := range lbs {
@@ -179,7 +191,12 @@ func main() {
 				continue
 			}
 			sort.Strings(kv)
-			remoteSet[ch.Get(strings.Join(kv, "_"))].seriesCh <- &ts
+
+			select {
+			case remoteSet[ch.Get(strings.Join(kv, "_"))].seriesCh <- &ts:
+			default:
+				promRWShardSeriesDropCounter.Inc()
+			}
 		}
 	})
 
@@ -231,7 +248,7 @@ func consumer(ctx context.Context, i int, r *remote) {
 			report()
 			close(r.seriesCh)
 			return
-		case <-time.After(10 * time.Second):
+		case <-time.After(5 * time.Second):
 			report()
 		case series := <-r.seriesCh:
 			container = append(container, series)
