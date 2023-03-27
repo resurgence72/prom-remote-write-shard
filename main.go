@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"strings"
 	"sync"
@@ -58,7 +59,7 @@ var (
 		return make([]prompb.TimeSeries, 0)
 	}}
 	builderPool = sync.Pool{New: func() any {
-		return strings.Builder{}
+		return bytes.Buffer{}
 	}}
 
 	// prometheus section
@@ -110,7 +111,7 @@ func main() {
 	default:
 		logrus.Fatalln("hash algorithm not support, only support murmur3 or crc32 algorithm")
 	}
-	logrus.Warnf("prom-remote-write-shard used %s hash algorithm", hashAlgorithm)
+	logrus.Warnf("prom-remote-write-shard used [%s] hash algorithm", hashAlgorithm)
 
 	switch shardKey {
 	case MetricShardKey:
@@ -118,7 +119,7 @@ func main() {
 	default:
 		logrus.Fatalln("shardKey not support, only support metric or series")
 	}
-	logrus.Warnf("prom-remote-write-shard used %s shard key", shardKey)
+	logrus.Warnf("prom-remote-write-shard used [%s] shard key", shardKey)
 
 	ps := strings.Split(promes, ",")
 	ch.Adds(ps...)
@@ -155,8 +156,14 @@ func main() {
 		}
 	}
 
-	http.Handle("/metrics", promhttp.Handler())
-	http.HandleFunc(remotePath, func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	mux.HandleFunc(remotePath, func(w http.ResponseWriter, r *http.Request) {
 		readBuf := bufPool.Get()
 		defer bufPool.Put(readBuf)
 
@@ -181,8 +188,8 @@ func main() {
 			return
 		}
 
-		builder := builderPool.Get().(strings.Builder)
-		defer builderPool.Put(builder)
+		buf := builderPool.Get().(bytes.Buffer)
+		defer builderPool.Put(buf)
 		for _, ts := range req.Timeseries {
 			ts := ts
 
@@ -190,27 +197,36 @@ func main() {
 			switch shardKey {
 			case SeriesShardKey:
 				for _, label := range lbs {
-					builder.WriteString(label.GetValue())
-					builder.WriteByte('_')
+					buf.WriteString(label.GetValue())
+					buf.WriteByte('_')
 				}
 			case MetricShardKey:
 				for _, label := range lbs {
 					if label.GetName() == "__name__" {
-						builder.WriteString(label.GetValue())
+						buf.WriteString(label.GetValue())
 						break
 					}
 				}
 			}
 
 			select {
-			case remoteSet[ch.Get(builder.String())].seriesCh <- &ts:
+			case remoteSet[ch.Get(buf.Bytes())].seriesCh <- &ts:
 			default:
 				promRWShardSeriesDropCounter.Inc()
 			}
 		}
 	})
 
-	http.ListenAndServe(addr, nil)
+	timeout := 30 * time.Second
+	serve := http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadTimeout:       timeout,
+		ReadHeaderTimeout: timeout,
+		WriteTimeout:      timeout,
+		IdleTimeout:       timeout,
+	}
+	serve.ListenAndServe()
 }
 
 func consumer(ctx context.Context, i int, r *remote) {
