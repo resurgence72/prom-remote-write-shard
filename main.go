@@ -184,6 +184,8 @@ func main() {
 		builder := builderPool.Get().(strings.Builder)
 		defer builderPool.Put(builder)
 		for _, ts := range req.Timeseries {
+			ts := ts
+
 			lbs := ts.Labels
 			switch shardKey {
 			case SeriesShardKey:
