@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -57,6 +56,9 @@ var (
 	bufPool = &pkg.ByteBufferPool{}
 	tsPool  = sync.Pool{New: func() any {
 		return make([]prompb.TimeSeries, 0)
+	}}
+	builderPool = sync.Pool{New: func() any {
+		return strings.Builder{}
 	}}
 
 	// prometheus section
@@ -106,8 +108,17 @@ func main() {
 	case CRC323Hash:
 		ch = pkg.New(pkg.WithCRC32Hash(crc32.ChecksumIEEE))
 	default:
-		logrus.Fatalln("hash algorithm not support, only support murmur3 and crc32 algorithm")
+		logrus.Fatalln("hash algorithm not support, only support murmur3 or crc32 algorithm")
 	}
+	logrus.Warnf("prom-remote-write-shard used %s hash algorithm", hashAlgorithm)
+
+	switch shardKey {
+	case MetricShardKey:
+	case SeriesShardKey:
+	default:
+		logrus.Fatalln("shardKey not support, only support metric or series")
+	}
+	logrus.Warnf("prom-remote-write-shard used %s shard key", shardKey)
 
 	ps := strings.Split(promes, ",")
 	ch.Adds(ps...)
@@ -121,8 +132,8 @@ func main() {
 			Address: prom,
 			RoundTripper: &http.Transport{
 				DialContext: (&net.Dialer{
-					Timeout:   5 * time.Second,
-					KeepAlive: 5 * time.Second,
+					Timeout:   15 * time.Second,
+					KeepAlive: 15 * time.Second,
 				}).DialContext,
 			},
 		})
@@ -170,30 +181,27 @@ func main() {
 			return
 		}
 
+		builder := builderPool.Get().(strings.Builder)
+		defer builderPool.Put(builder)
 		for _, ts := range req.Timeseries {
-			ts := ts
-
 			lbs := ts.Labels
-			kv := make([]string, 0, len(lbs))
 			switch shardKey {
 			case SeriesShardKey:
 				for _, label := range lbs {
-					kv = append(kv, label.Value)
+					builder.WriteString(label.GetValue())
+					builder.WriteByte('_')
 				}
 			case MetricShardKey:
 				for _, label := range lbs {
-					if label.Name == "__name__" {
-						kv = append(kv, label.Value)
+					if label.GetName() == "__name__" {
+						builder.WriteString(label.GetValue())
 						break
 					}
 				}
-			default:
-				continue
 			}
-			sort.Strings(kv)
 
 			select {
-			case remoteSet[ch.Get(strings.Join(kv, "_"))].seriesCh <- &ts:
+			case remoteSet[ch.Get(builder.String())].seriesCh <- &ts:
 			default:
 				promRWShardSeriesDropCounter.Inc()
 			}
@@ -261,7 +269,6 @@ func consumer(ctx context.Context, i int, r *remote) {
 }
 
 func send(r *remote, req []byte) {
-	logrus.Warnln("send batch", batch)
 	httpReq, err := http.NewRequest("POST", r.addr, bytes.NewReader(req))
 	if err != nil {
 		return
@@ -277,6 +284,7 @@ func send(r *remote, req []byte) {
 		logrus.Errorln("api do failed", err)
 		return
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		all, _ := io.ReadAll(resp.Body)

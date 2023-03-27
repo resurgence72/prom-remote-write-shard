@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prom-remote-write-shard-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prom-remote-write-shard
+  template:
+    metadata:
+      labels:
+        app: prom-remote-write-shard
+    spec:
+      containers:
+        - name: prom-remote-write-shard
+          image: prom-remote-write-shard
+          imagePullPolicy: IfNotPresent
+          command:
+            - /opt/app/prom-remote-write-shard
+          args:
+            - -listen=127.0.0.0:9999
+            - -promes=http://localhost:9090/api/v1/write,http://localhost:9091/api/v1/write
+            - -shard_key=series
+            - -batch=5000
+          resources:
+            requests:
+              cpu: 100m
+              memory: 100Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prom-remote-write-shard-service
+spec:
+  type: ClusterIP
+  selector:
+    app: prom-remote-write-shard
+  ports:
+    - name: http
+      port: 9999
+      targetPort: 9999
