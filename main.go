@@ -189,7 +189,10 @@ func main() {
 		}
 
 		buf := builderPool.Get().(bytes.Buffer)
-		defer builderPool.Put(buf)
+		defer func() {
+			buf.Reset()
+			builderPool.Put(buf)
+		}()
 		for _, ts := range req.Timeseries {
 			ts := ts
 
@@ -239,7 +242,10 @@ func consumer(ctx context.Context, i int, r *remote) {
 		}
 
 		c := tsPool.Get().([]prompb.TimeSeries)
-		defer tsPool.Put(c)
+		defer func() {
+			c = c[:0]
+			tsPool.Put(c)
+		}()
 
 		// copy
 		for _, series := range container {
