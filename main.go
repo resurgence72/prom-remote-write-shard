@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"flag"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"prom-remote-write-shard/pkg"
@@ -23,6 +26,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/sirupsen/logrus"
+	"github.com/spaolacci/murmur3"
 )
 
 const (
@@ -36,15 +40,19 @@ const (
 )
 
 type remote struct {
-	addr     string
-	api      api.Client
-	seriesCh chan *prompb.TimeSeries
+	addr       string
+	api        api.Client
+	seriesChs  []chan *prompb.TimeSeries
+	containers [][]*prompb.TimeSeries
+
+	shard int
 }
 
 var (
 	// flag section
 	promes        string
 	shardKey      string
+	shard         int
 	addr          string
 	remotePath    string
 	hashAlgorithm string
@@ -76,6 +84,7 @@ func initFlag() {
 	flag.StringVar(&remotePath, "remote_path", "/api/v1/write", "http remote路径")
 	flag.StringVar(&hashAlgorithm, "hash_algorithm", "murmur3", "一致性哈希算法")
 	flag.IntVar(&batch, "batch", 5000, "批量发送大小")
+	flag.IntVar(&shard, "shard", 2, "分片数")
 	flag.BoolVar(&h, "h", false, "帮助信息")
 	flag.BoolVar(&v, "v", false, "版本信息")
 
@@ -127,6 +136,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
 
+	var wg sync.WaitGroup
 	remoteSet := make(map[string]*remote, len(ps))
 	for i, prom := range ps {
 		client, _ := api.NewClient(api.Config{
@@ -138,14 +148,27 @@ func main() {
 				}).DialContext,
 			},
 		})
+
+		// shard
+		var (
+			seriesChs  []chan *prompb.TimeSeries
+			containers [][]*prompb.TimeSeries
+		)
+		for i := 0; i < shard; i++ {
+			seriesChs = append(seriesChs, make(chan *prompb.TimeSeries, batch))
+			containers = append(containers, make([]*prompb.TimeSeries, 0, batch))
+		}
+
 		r := &remote{
-			addr:     prom,
-			api:      client,
-			seriesCh: make(chan *prompb.TimeSeries, batch),
+			addr:       prom,
+			api:        client,
+			seriesChs:  seriesChs,
+			containers: containers,
+			shard:      shard,
 		}
 
 		remoteSet[prom] = r
-		go consumer(ctx, i, r)
+		go consumer(ctx, &wg, i, r)
 	}
 
 	read := func(r *http.Request, bb *pkg.ByteBuffer) error {
@@ -211,9 +234,10 @@ func main() {
 					}
 				}
 			}
+			fmt.Println("aaa ", murmur3.Sum32([]byte(ts.String()))%uint32(shard))
 
 			select {
-			case remoteSet[ch.Get(buf.Bytes())].seriesCh <- &ts:
+			case remoteSet[ch.Get(buf.Bytes())].seriesChs[murmur3.Sum32([]byte(ts.String()))%uint32(shard)] <- &ts:
 			default:
 				promRWShardSeriesDropCounter.Inc()
 			}
@@ -229,17 +253,30 @@ func main() {
 		WriteTimeout:      timeout,
 		IdleTimeout:       timeout,
 	}
-	serve.ListenAndServe()
+
+	go serve.ListenAndServe()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	<-quit
+
+	serve.Shutdown(ctx)
+	cancel()
+	wg.Wait()
 }
 
-func consumer(ctx context.Context, i int, r *remote) {
-	logrus.Warnln("consumer start", i, r.addr)
+func consumer(ctx context.Context, wg *sync.WaitGroup, i int, r *remote) {
+	logrus.Warnf("consumer [%d] start [%s], shard [%d]", i, r.addr, r.shard)
 
-	container := make([]*prompb.TimeSeries, 0, batch)
-	report := func() {
+	report := func(container []*prompb.TimeSeries) {
 		if len(container) == 0 {
 			return
 		}
+
+		defer func() {
+			// re-slice
+			container = container[:0]
+		}()
 
 		c := tsPool.Get().([]prompb.TimeSeries)
 		defer func() {
@@ -252,9 +289,6 @@ func consumer(ctx context.Context, i int, r *remote) {
 			series := series
 			c = append(c, *series)
 		}
-
-		// re-slice
-		container = container[:0]
 
 		// send series
 		req := &prompb.WriteRequest{
@@ -274,21 +308,29 @@ func consumer(ctx context.Context, i int, r *remote) {
 		go send(r, snappy.Encode(bb.B[:cap(bb.B)], marshal))
 	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			report()
-			close(r.seriesCh)
-			return
-		case <-time.After(5 * time.Second):
-			report()
-		case series := <-r.seriesCh:
-			container = append(container, series)
+	wg.Add(r.shard)
+	for shard := 0; shard < r.shard; shard++ {
+		go func(shard int) {
+			defer wg.Done()
 
-			if len(container) == cap(container) {
-				report()
+			container := r.containers[shard]
+			for {
+				select {
+				case <-ctx.Done():
+					report(container)
+					close(r.seriesChs[shard])
+					return
+				case <-time.After(5 * time.Second):
+					report(container)
+				case series := <-r.seriesChs[shard]:
+					container = append(container, series)
+
+					if len(container) == cap(container) {
+						report(container)
+					}
+				}
 			}
-		}
+		}(shard)
 	}
 }
 
