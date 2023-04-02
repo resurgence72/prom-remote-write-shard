@@ -26,6 +26,8 @@
 > 		http remote路径 (default "/api/v1/write")
 > -shard_key string
 > 		根据什么来分片,metric/series (default "series")
+> -shard int
+>        每个remote write的分片数 (default 2)
 > -v    版本信息
 > ```
 

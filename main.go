@@ -84,7 +84,7 @@ func initFlag() {
 	flag.StringVar(&remotePath, "remote_path", "/api/v1/write", "http remote路径")
 	flag.StringVar(&hashAlgorithm, "hash_algorithm", "murmur3", "一致性哈希算法")
 	flag.IntVar(&batch, "batch", 5000, "批量发送大小")
-	flag.IntVar(&shard, "shard", 2, "分片数")
+	flag.IntVar(&shard, "shard", 2, "每个remote write的分片数")
 	flag.BoolVar(&h, "h", false, "帮助信息")
 	flag.BoolVar(&v, "v", false, "版本信息")
 
