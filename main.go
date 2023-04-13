@@ -67,7 +67,7 @@ var (
 		return make([]prompb.TimeSeries, 0)
 	}}
 	builderPool = sync.Pool{New: func() any {
-		return bytes.Buffer{}
+		return &bytes.Buffer{}
 	}}
 
 	// prometheus section
@@ -211,7 +211,7 @@ func main() {
 			return
 		}
 
-		buf := builderPool.Get().(bytes.Buffer)
+		buf := builderPool.Get().(*bytes.Buffer)
 		defer func() {
 			buf.Reset()
 			builderPool.Put(buf)
