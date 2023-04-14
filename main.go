@@ -95,7 +95,7 @@ func initFlag() {
 	flag.IntVar(&shard, "shard", 2, "每个remote write的分片数")
 
 	flag.IntVar(&remoteWriteRetryTimes, "remote_write_retry_times", 3, "remote write 重试次数")
-	flag.IntVar(&remoteWriteTimeout, "remote_write_timeout", 1, "remote write 超时时间 (s)")
+	flag.IntVar(&remoteWriteTimeout, "remote_write_timeout", 5, "remote write 超时时间 (s)")
 	flag.IntVar(&remoteWriteMinWait, "remote_write_min_wait", 200, "remote write 首次重试间隔 (ms)")
 
 	flag.BoolVar(&h, "h", false, "帮助信息")
