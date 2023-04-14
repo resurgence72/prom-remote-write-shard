@@ -5,7 +5,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/hashicorp/go-retryablehttp"
 	"hash/crc32"
 	"io"
 	"net/http"
@@ -17,6 +16,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/hashicorp/go-retryablehttp"
 
 	"prom-remote-write-shard/pkg"
 
