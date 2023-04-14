@@ -23,11 +23,17 @@
 > -hash_algorithm string                     
 >         一致性哈希算法 (default "murmur3")
 > -remote_path string
-> 		http remote路径 (default "/api/v1/write")
+> 		组件接收remote write的 http path (default "/api/v1/receive")
 > -shard_key string
 > 		根据什么来分片,metric/series (default "series")
 > -shard int
 >        每个remote write的分片数 (default 2)
+>   -remote_write_min_wait int
+>        remote write 首次重试间隔 (ms) (default 200)
+> -remote_write_retry_times int
+>        remote write 重试次数 (default 3)
+> -remote_write_timeout int
+>        remote write 超时时间 (s) (default 1)
 > -v    版本信息
 > ```
 

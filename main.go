@@ -88,7 +88,7 @@ func initFlag() {
 	flag.StringVar(&promes, "promes", "http://localhost:9090/api/v1/write", "prometheus地址，多台使用 `,` 逗号分割")
 	flag.StringVar(&shardKey, "shard_key", "series", "根据什么来分片,metric/series")
 	flag.StringVar(&addr, "listen", "0.0.0.0:9999", "http监听地址")
-	flag.StringVar(&remotePath, "remote_path", "/api/v1/receive", "http remote路径")
+	flag.StringVar(&remotePath, "remote_path", "/api/v1/receive", "组件接收remote write的 http path")
 	flag.StringVar(&hashAlgorithm, "hash_algorithm", "murmur3", "一致性哈希算法")
 
 	flag.IntVar(&batch, "batch", 5000, "批量发送大小")
