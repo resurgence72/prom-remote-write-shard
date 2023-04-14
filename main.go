@@ -5,11 +5,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/hashicorp/go-retryablehttp"
 	"hash/crc32"
 	"io"
-	"net"
 	"net/http"
 	"net/http/pprof"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -21,7 +22,6 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
-	"github.com/prometheus/client_golang/api"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/prometheus/prompb"
@@ -41,7 +41,7 @@ const (
 
 type remote struct {
 	addr       string
-	api        api.Client
+	api        *http.Client
 	seriesChs  []chan *prompb.TimeSeries
 	containers [][]*prompb.TimeSeries
 
@@ -52,11 +52,16 @@ var (
 	// flag section
 	promes        string
 	shardKey      string
-	shard         int
 	addr          string
 	remotePath    string
 	hashAlgorithm string
-	batch         int
+
+	batch int
+	shard int
+
+	remoteWriteRetryTimes int
+	remoteWriteTimeout    int // s
+	remoteWriteMinWait    int // ms
 
 	h bool
 	v bool
@@ -75,16 +80,24 @@ var (
 		Name: "prom_rw_shard_series_drop_counter",
 		Help: "prom rw shard series drop counter",
 	})
+
+	alive, lose map[string]struct{}
 )
 
 func initFlag() {
 	flag.StringVar(&promes, "promes", "http://localhost:9090/api/v1/write", "prometheus地址，多台使用 `,` 逗号分割")
 	flag.StringVar(&shardKey, "shard_key", "series", "根据什么来分片,metric/series")
 	flag.StringVar(&addr, "listen", "0.0.0.0:9999", "http监听地址")
-	flag.StringVar(&remotePath, "remote_path", "/api/v1/write", "http remote路径")
+	flag.StringVar(&remotePath, "remote_path", "/api/v1/receive", "http remote路径")
 	flag.StringVar(&hashAlgorithm, "hash_algorithm", "murmur3", "一致性哈希算法")
+
 	flag.IntVar(&batch, "batch", 5000, "批量发送大小")
 	flag.IntVar(&shard, "shard", 2, "每个remote write的分片数")
+
+	flag.IntVar(&remoteWriteRetryTimes, "remote_write_retry_times", 3, "remote write 重试次数")
+	flag.IntVar(&remoteWriteTimeout, "remote_write_timeout", 1, "remote write 超时时间 (s)")
+	flag.IntVar(&remoteWriteMinWait, "remote_write_min_wait", 200, "remote write 首次重试间隔 (ms)")
+
 	flag.BoolVar(&h, "h", false, "帮助信息")
 	flag.BoolVar(&v, "v", false, "版本信息")
 
@@ -131,7 +144,18 @@ func main() {
 	logrus.Warnf("prom-remote-write-shard used [%s] shard key", shardKey)
 
 	ps := strings.Split(promes, ",")
-	ch.Adds(ps...)
+	alive = make(map[string]struct{}, len(ps))
+	lose = make(map[string]struct{}, len(ps))
+
+	for _, p := range ps {
+		_, err := url.ParseRequestURI(p)
+		if err != nil {
+			logrus.Fatalf("remote write url [%s] parse failed: [%s]", p, err)
+		}
+
+		ch.Add(p)
+		alive[p] = struct{}{}
+	}
 
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
@@ -139,15 +163,20 @@ func main() {
 	var wg sync.WaitGroup
 	remoteSet := make(map[string]*remote, len(ps))
 	for i, prom := range ps {
-		client, _ := api.NewClient(api.Config{
-			Address: prom,
-			RoundTripper: &http.Transport{
-				DialContext: (&net.Dialer{
-					Timeout:   15 * time.Second,
-					KeepAlive: 15 * time.Second,
-				}).DialContext,
-			},
-		})
+		//client, _ := api.NewClient(api.Config{
+		//	Address: prom,
+		//	RoundTripper: &http.Transport{
+		//		DialContext: (&net.Dialer{
+		//			Timeout:   15 * time.Second,
+		//			KeepAlive: 15 * time.Second,
+		//		}).DialContext,
+		//	},
+		//})
+		client := retryWithBackOff(
+			remoteWriteRetryTimes,
+			time.Duration(remoteWriteMinWait)*time.Millisecond,
+			time.Duration(remoteWriteTimeout)*time.Second,
+		)
 
 		// shard
 		var (
@@ -234,7 +263,6 @@ func main() {
 					}
 				}
 			}
-			fmt.Println("aaa ", murmur3.Sum32([]byte(ts.String()))%uint32(shard))
 
 			select {
 			case remoteSet[ch.Get(buf.Bytes())].seriesChs[murmur3.Sum32([]byte(ts.String()))%uint32(shard)] <- &ts:
@@ -255,6 +283,7 @@ func main() {
 	}
 
 	go serve.ListenAndServe()
+	go watchDog(ctx, ch)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
@@ -266,7 +295,7 @@ func main() {
 }
 
 func consumer(ctx context.Context, wg *sync.WaitGroup, i int, r *remote) {
-	logrus.Warnf("consumer [%d] start [%s], shard [%d]", i, r.addr, r.shard)
+	logrus.Warnf("consumer [%d] start [%s], shards [%d] for pre consumer", i, r.addr, r.shard)
 
 	report := func(container []*prompb.TimeSeries) {
 		if len(container) == 0 {
@@ -334,6 +363,15 @@ func consumer(ctx context.Context, wg *sync.WaitGroup, i int, r *remote) {
 	}
 }
 
+func retryWithBackOff(retry int, minWait, timeout time.Duration) *http.Client {
+	retryClient := retryablehttp.NewClient()
+	retryClient.RetryMax = retry
+	retryClient.RetryWaitMin = minWait
+	retryClient.HTTPClient.Timeout = timeout
+	retryClient.Logger = nil
+	return retryClient.StandardClient()
+}
+
 func send(r *remote, req []byte) {
 	httpReq, err := http.NewRequest("POST", r.addr, bytes.NewReader(req))
 	if err != nil {
@@ -345,16 +383,102 @@ func send(r *remote, req []byte) {
 	httpReq.Header.Set("User-Agent", "prom-remote-write-shard")
 	httpReq.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
 
-	resp, _, err := r.api.Do(context.Background(), httpReq)
+	resp, err := r.api.Do(httpReq)
 	if err != nil {
 		logrus.Errorln("api do failed", err)
 		return
 	}
-	defer resp.Body.Close()
+	defer clean(resp)
 
 	if resp.StatusCode >= 400 {
 		all, _ := io.ReadAll(resp.Body)
 		logrus.Errorln("api do status code >= 400", resp.StatusCode, string(all))
 		return
 	}
+}
+
+func clean(resp *http.Response) {
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+}
+
+func watchDog(ctx context.Context, ch *pkg.Map) {
+	loop := 3 * time.Second
+
+	isLose := func() {
+		for {
+			select {
+			case <-time.After(loop):
+				for addr := range alive {
+					if !isHealthy(addr) {
+						offline(addr)
+						reHash(ch)
+					}
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+	isAlive := func() {
+		for {
+			select {
+			case <-time.After(loop):
+				for addr := range lose {
+					if isHealthy(addr) {
+						online(addr)
+						reHash(ch)
+					}
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+
+	go isLose()
+	go isAlive()
+}
+
+func reHash(ch *pkg.Map) {
+	var s []string
+	for a := range alive {
+		s = append(s, a)
+	}
+	ch.ReHash(s...)
+
+	logrus.Warnf("now hash ring has [%d] nodes", len(alive))
+}
+
+func online(addr string) {
+	logrus.Warnln("remote write online:", addr)
+
+	alive[addr] = struct{}{}
+	delete(lose, addr)
+}
+
+func offline(addr string) {
+	logrus.Warnln("remote write offline:", addr)
+
+	lose[addr] = struct{}{}
+	delete(alive, addr)
+}
+
+func isHealthy(addr string) bool {
+	parse, _ := url.Parse(addr)
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s://%s/-/healthy", parse.Scheme, parse.Host), nil)
+	if err != nil {
+		return false
+	}
+
+	resp, err := retryWithBackOff(
+		3,
+		100*time.Millisecond,
+		time.Second,
+	).Do(req)
+	if err == nil && resp.StatusCode == 200 {
+		defer clean(resp)
+		return true
+	}
+	return false
 }

@@ -57,38 +57,36 @@ func New(opts ...Option) *Map {
 }
 
 func (m *Map) ReHash(keys ...string) {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-
 	m = &Map{
 		hashMap: make(map[int]string),
 		keys:    make([]int, 0),
 	}
-
 	m.Adds(keys...)
 }
 
 // 批量添加key到ring
 func (m *Map) Adds(keys ...string) {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-
 	for _, key := range keys {
 		m.add(key)
 	}
-	sort.Ints(m.keys)
+	m.sortKeys()
 }
 
 // 添加单个key到ring
 func (m *Map) Add(key string) {
+	m.add(key)
+	m.sortKeys()
+}
+
+func (m *Map) sortKeys() {
 	m.lock.Lock()
 	defer m.lock.Unlock()
-
-	m.add(key)
 	sort.Ints(m.keys)
 }
 
 func (m *Map) add(key string) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
 	for i := 0; i < m.replicas; i++ {
 		hash := int(m.hash([]byte(strconv.Itoa(i) + key)))
 		m.keys = append(m.keys, hash)
@@ -98,12 +96,12 @@ func (m *Map) add(key string) {
 
 // 根据key获取node
 func (m *Map) Get(key []byte) string {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+
 	if len(m.keys) == 0 {
 		return ""
 	}
-
-	m.lock.RLock()
-	defer m.lock.RUnlock()
 
 	hash := int(m.hash(key))
 	idx := sort.Search(len(m.keys), func(i int) bool {
