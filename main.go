@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	version = "v0.0.1"
+	version = "v0.0.2"
 
 	MetricShardKey = "metric"
 	SeriesShardKey = "series"
