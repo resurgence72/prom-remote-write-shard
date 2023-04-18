@@ -342,6 +342,9 @@ func consumer(ctx context.Context, wg *sync.WaitGroup, i int, r *remote) {
 	for shard := 0; shard < r.shard; shard++ {
 		go func(shard int) {
 			defer wg.Done()
+			
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
 
 			container := r.containers[shard]
 			for {
@@ -350,7 +353,7 @@ func consumer(ctx context.Context, wg *sync.WaitGroup, i int, r *remote) {
 					report(container)
 					close(r.seriesChs[shard])
 					return
-				case <-time.After(5 * time.Second):
+				case <-ticker.C:
 					report(container)
 				case series := <-r.seriesChs[shard]:
 					container = append(container, series)
@@ -407,9 +410,12 @@ func watchDog(ctx context.Context, ch *pkg.Map) {
 	loop := 3 * time.Second
 
 	isLose := func() {
+		ticker := time.NewTicker(loop)
+		defer ticker.Stop()
+
 		for {
 			select {
-			case <-time.After(loop):
+			case <-ticker.C:
 				for addr := range alive {
 					if !isHealthy(addr) {
 						offline(addr)
@@ -422,9 +428,12 @@ func watchDog(ctx context.Context, ch *pkg.Map) {
 		}
 	}
 	isAlive := func() {
+		ticker := time.NewTicker(loop)
+		defer ticker.Stop()
+		
 		for {
 			select {
-			case <-time.After(loop):
+			case <-ticker.C:
 				for addr := range lose {
 					if isHealthy(addr) {
 						online(addr)
