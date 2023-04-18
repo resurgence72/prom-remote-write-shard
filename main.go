@@ -410,12 +410,9 @@ func watchDog(ctx context.Context, ch *pkg.Map) {
 	loop := 3 * time.Second
 
 	isLose := func() {
-		ticker := time.NewTicker(loop)
-		defer ticker.Stop()
-
 		for {
 			select {
-			case <-ticker.C:
+			case <-time.After(loop):
 				for addr := range alive {
 					if !isHealthy(addr) {
 						offline(addr)
@@ -428,12 +425,9 @@ func watchDog(ctx context.Context, ch *pkg.Map) {
 		}
 	}
 	isAlive := func() {
-		ticker := time.NewTicker(loop)
-		defer ticker.Stop()
-		
 		for {
 			select {
-			case <-ticker.C:
+			case <-time.After(loop):
 				for addr := range lose {
 					if isHealthy(addr) {
 						online(addr)
