@@ -57,10 +57,13 @@ func New(opts ...Option) *Map {
 }
 
 func (m *Map) ReHash(keys ...string) {
-	m = &Map{
-		hashMap: make(map[int]string),
-		keys:    make([]int, 0),
-	}
+	//*m = Map{
+	//	hashMap: make(map[int]string),
+	//	keys:    make([]int, 0),
+	//}
+	m.hashMap = make(map[int]string)
+	m.keys = make([]int, 0)
+
 	m.Adds(keys...)
 }
 

@@ -31,7 +31,7 @@ import (
 )
 
 const (
-	version = "v0.0.2"
+	version = "v0.0.3"
 
 	MetricShardKey = "metric"
 	SeriesShardKey = "series"
@@ -50,6 +50,8 @@ type remote struct {
 }
 
 var (
+	ring *pkg.Map
+
 	// flag section
 	promes        string
 	shardKey      string
@@ -83,6 +85,9 @@ var (
 	})
 
 	alive, lose map[string]struct{}
+	ready       = make(chan struct{})
+
+	m sync.Mutex
 )
 
 func initFlag() {
@@ -125,12 +130,11 @@ func main() {
 	// register prom metrics
 	prometheus.Register(promRWShardSeriesDropCounter)
 
-	var ch *pkg.Map
 	switch hashAlgorithm {
 	case MURMUR3Hash:
-		ch = pkg.New()
+		ring = pkg.New()
 	case CRC323Hash:
-		ch = pkg.New(pkg.WithCRC32Hash(crc32.ChecksumIEEE))
+		ring = pkg.New(pkg.WithCRC32Hash(crc32.ChecksumIEEE))
 	default:
 		logrus.Fatalln("hash algorithm not support, only support murmur3 or crc32 algorithm")
 	}
@@ -154,12 +158,11 @@ func main() {
 			logrus.Fatalf("remote write url [%s] parse failed: [%s]", p, err)
 		}
 
-		ch.Add(p)
+		ring.Add(p)
 		alive[p] = struct{}{}
 	}
 
 	ctx, cancel := context.WithCancel(context.TODO())
-	defer cancel()
 
 	var wg sync.WaitGroup
 	remoteSet := make(map[string]*remote, len(ps))
@@ -180,10 +183,9 @@ func main() {
 		)
 
 		// shard
-		var (
-			seriesChs  []chan *prompb.TimeSeries
-			containers [][]*prompb.TimeSeries
-		)
+		seriesChs := make([]chan *prompb.TimeSeries, 0, shard)
+		containers := make([][]*prompb.TimeSeries, 0, shard)
+
 		for i := 0; i < shard; i++ {
 			seriesChs = append(seriesChs, make(chan *prompb.TimeSeries, batch))
 			containers = append(containers, make([]*prompb.TimeSeries, 0, batch))
@@ -242,20 +244,26 @@ func main() {
 		}
 
 		buf := builderPool.Get().(*bytes.Buffer)
+		toByte := builderPool.Get().(*bytes.Buffer)
 		defer func() {
 			buf.Reset()
+			toByte.Reset()
 			builderPool.Put(buf)
+			builderPool.Put(toByte)
 		}()
-		for _, ts := range req.Timeseries {
-			ts := ts
 
+		for i := range req.Timeseries {
+			ts := req.Timeseries[i]
+			reuse := false
 			lbs := ts.Labels
+
 			switch shardKey {
 			case SeriesShardKey:
 				for _, label := range lbs {
 					buf.WriteString(label.GetValue())
 					buf.WriteByte('_')
 				}
+				reuse = true
 			case MetricShardKey:
 				for _, label := range lbs {
 					if label.GetName() == "__name__" {
@@ -265,10 +273,25 @@ func main() {
 				}
 			}
 
-			select {
-			case remoteSet[ch.Get(buf.Bytes())].seriesChs[murmur3.Sum32([]byte(ts.String()))%uint32(shard)] <- &ts:
-			default:
-				promRWShardSeriesDropCounter.Inc()
+			if rt, ok := remoteSet[ring.Get(buf.Bytes())]; ok {
+				var key []byte
+				if reuse {
+					key = buf.Bytes()
+				} else {
+					toByte.Reset()
+					for _, label := range lbs {
+						toByte.WriteString(label.GetName())
+						toByte.WriteByte('_')
+						toByte.WriteString(label.GetValue())
+					}
+					key = toByte.Bytes()
+				}
+
+				select {
+				case rt.seriesChs[murmur3.Sum32(key)%uint32(shard)] <- &ts:
+				default:
+					promRWShardSeriesDropCounter.Inc()
+				}
 			}
 		}
 	})
@@ -283,8 +306,11 @@ func main() {
 		IdleTimeout:       timeout,
 	}
 
+	go watchDog(ctx)
+
+	<-ready
+	logrus.Warnln("prom-remote-write-shard is ready to receive traffic")
 	go serve.ListenAndServe()
-	go watchDog(ctx, ch)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
@@ -298,14 +324,14 @@ func main() {
 func consumer(ctx context.Context, wg *sync.WaitGroup, i int, r *remote) {
 	logrus.Warnf("consumer [%d] start [%s], shards [%d] for pre consumer", i, r.addr, r.shard)
 
-	report := func(container []*prompb.TimeSeries) {
-		if len(container) == 0 {
+	report := func(shard int) {
+		if len(r.containers[shard]) == 0 {
 			return
 		}
-
+		logrus.Warnf("consumer [%d] - shard [%d] start report series, len [%d]", i, shard, len(r.containers[shard]))
 		defer func() {
 			// re-slice
-			container = container[:0]
+			r.containers[shard] = r.containers[shard][:0]
 		}()
 
 		c := tsPool.Get().([]prompb.TimeSeries)
@@ -315,20 +341,14 @@ func consumer(ctx context.Context, wg *sync.WaitGroup, i int, r *remote) {
 		}()
 
 		// copy
-		for _, series := range container {
-			series := series
-			c = append(c, *series)
-		}
-
-		// send series
-		req := &prompb.WriteRequest{
-			Timeseries: c,
+		for idx := range r.containers[shard] {
+			c = append(c, *r.containers[shard][idx])
 		}
 
 		bb := bufPool.Get()
 		defer bufPool.Put(bb)
 
-		marshal, err := proto.Marshal(req)
+		marshal, err := proto.Marshal(&prompb.WriteRequest{Timeseries: c})
 		if err != nil {
 			logrus.Errorln("send series proto marshal failed", err)
 			return
@@ -341,25 +361,24 @@ func consumer(ctx context.Context, wg *sync.WaitGroup, i int, r *remote) {
 	wg.Add(r.shard)
 	for shard := 0; shard < r.shard; shard++ {
 		go func(shard int) {
-			defer wg.Done()
-			
 			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
+			defer func() {
+				wg.Done()
+				ticker.Stop()
+				close(r.seriesChs[shard])
+			}()
 
-			container := r.containers[shard]
 			for {
 				select {
 				case <-ctx.Done():
-					report(container)
-					close(r.seriesChs[shard])
+					report(shard)
 					return
 				case <-ticker.C:
-					report(container)
+					report(shard)
 				case series := <-r.seriesChs[shard]:
-					container = append(container, series)
-
-					if len(container) == cap(container) {
-						report(container)
+					r.containers[shard] = append(r.containers[shard], series)
+					if len(r.containers[shard]) == batch {
+						report(shard)
 					}
 				}
 			}
@@ -406,19 +425,24 @@ func clean(resp *http.Response) {
 	resp.Body.Close()
 }
 
-func watchDog(ctx context.Context, ch *pkg.Map) {
+func watchDog(ctx context.Context) {
 	loop := 3 * time.Second
 
+	var once sync.Once
 	isLose := func() {
 		for {
+			for addr := range alive {
+				if !isHealthy(addr) {
+					offline(addr)
+					reHash()
+				}
+			}
+
+			once.Do(func() {
+				close(ready)
+			})
 			select {
 			case <-time.After(loop):
-				for addr := range alive {
-					if !isHealthy(addr) {
-						offline(addr)
-						reHash(ch)
-					}
-				}
 			case <-ctx.Done():
 				return
 			}
@@ -426,14 +450,14 @@ func watchDog(ctx context.Context, ch *pkg.Map) {
 	}
 	isAlive := func() {
 		for {
+			for addr := range lose {
+				if isHealthy(addr) {
+					online(addr)
+					reHash()
+				}
+			}
 			select {
 			case <-time.After(loop):
-				for addr := range lose {
-					if isHealthy(addr) {
-						online(addr)
-						reHash(ch)
-					}
-				}
 			case <-ctx.Done():
 				return
 			}
@@ -444,17 +468,21 @@ func watchDog(ctx context.Context, ch *pkg.Map) {
 	go isAlive()
 }
 
-func reHash(ch *pkg.Map) {
+func reHash() {
+	m.Lock()
 	var s []string
 	for a := range alive {
 		s = append(s, a)
 	}
-	ch.ReHash(s...)
+	m.Unlock()
 
+	ring.ReHash(s...)
 	logrus.Warnf("now hash ring has [%d] nodes", len(alive))
 }
 
 func online(addr string) {
+	m.Lock()
+	defer m.Unlock()
 	logrus.Warnln("remote write online:", addr)
 
 	alive[addr] = struct{}{}
@@ -462,6 +490,8 @@ func online(addr string) {
 }
 
 func offline(addr string) {
+	m.Lock()
+	defer m.Unlock()
 	logrus.Warnln("remote write offline:", addr)
 
 	lose[addr] = struct{}{}
