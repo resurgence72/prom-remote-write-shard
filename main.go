@@ -98,7 +98,7 @@ func initFlag() {
 	flag.StringVar(&hashAlgorithm, "hash_algorithm", "murmur3", "一致性哈希算法")
 
 	flag.IntVar(&batch, "batch", 5000, "批量发送大小")
-	flag.IntVar(&shard, "shard", 2, "每个remote write的分片数")
+	flag.IntVar(&shard, "shard", 2, "每个remote write的分片数,必须为2的n次方")
 
 	flag.IntVar(&remoteWriteRetryTimes, "remote_write_retry_times", 3, "remote write 重试次数")
 	flag.IntVar(&remoteWriteTimeout, "remote_write_timeout", 5, "remote write 超时时间 (s)")
@@ -127,8 +127,12 @@ func main() {
 		logrus.Fatalln("promes can not be empty")
 	}
 
-	// register prom metrics
-	prometheus.Register(promRWShardSeriesDropCounter)
+	// 保证shard为2的n次方
+	if !func() bool {
+		return shard > 0 && (shard&(shard-1)) == 0
+	}() {
+		logrus.Fatalln("shard has to be 2 to the n power")
+	}
 
 	switch hashAlgorithm {
 	case MURMUR3Hash:
@@ -147,6 +151,9 @@ func main() {
 		logrus.Fatalln("shardKey not support, only support metric or series")
 	}
 	logrus.Warnf("prom-remote-write-shard used [%s] shard key", shardKey)
+
+	// register prom metrics
+	prometheus.Register(promRWShardSeriesDropCounter)
 
 	ps := strings.Split(promes, ",")
 	alive = make(map[string]struct{}, len(ps))
@@ -252,17 +259,22 @@ func main() {
 			builderPool.Put(toByte)
 		}()
 
+		bufWrite := func(buf *bytes.Buffer, lbs []prompb.Label) {
+			for _, label := range lbs {
+				buf.WriteString(label.GetName())
+				buf.WriteByte('_')
+				buf.WriteString(label.GetValue())
+			}
+		}
+
 		for i := range req.Timeseries {
 			ts := req.Timeseries[i]
 			reuse := false
-			lbs := ts.Labels
+			lbs := ts.GetLabels()
 
 			switch shardKey {
 			case SeriesShardKey:
-				for _, label := range lbs {
-					buf.WriteString(label.GetValue())
-					buf.WriteByte('_')
-				}
+				bufWrite(buf, lbs)
 				reuse = true
 			case MetricShardKey:
 				for _, label := range lbs {
@@ -273,22 +285,24 @@ func main() {
 				}
 			}
 
-			if rt, ok := remoteSet[ring.Get(buf.Bytes())]; ok {
-				var key []byte
+			var (
+				key  []byte
+				hash uint32
+			)
+			node, nh := ring.Get(buf.Bytes())
+			if rt, ok := remoteSet[node]; ok {
 				if reuse {
 					key = buf.Bytes()
+					hash = nh
 				} else {
 					toByte.Reset()
-					for _, label := range lbs {
-						toByte.WriteString(label.GetName())
-						toByte.WriteByte('_')
-						toByte.WriteString(label.GetValue())
-					}
+					bufWrite(toByte, lbs)
 					key = toByte.Bytes()
+					hash = murmur3.Sum32(key)
 				}
 
 				select {
-				case rt.seriesChs[murmur3.Sum32(key)%uint32(shard)] <- &ts:
+				case rt.seriesChs[hash&uint32(shard-1)] <- &ts:
 				default:
 					promRWShardSeriesDropCounter.Inc()
 				}
