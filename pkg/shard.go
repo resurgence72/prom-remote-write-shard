@@ -98,18 +98,19 @@ func (m *Map) add(key string) {
 }
 
 // 根据key获取node
-func (m *Map) Get(key []byte) string {
+func (m *Map) Get(key []byte) (string, uint32) {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
 
 	if len(m.keys) == 0 {
-		return ""
+		return "", 0
 	}
 
-	hash := int(m.hash(key))
+	h := m.hash(key)
+	hash := int(h)
 	idx := sort.Search(len(m.keys), func(i int) bool {
 		return m.keys[i] >= hash
 	})
 
-	return m.hashMap[m.keys[idx%len(m.keys)]]
+	return m.hashMap[m.keys[idx%len(m.keys)]], h
 }
