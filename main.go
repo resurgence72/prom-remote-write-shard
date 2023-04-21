@@ -66,8 +66,9 @@ var (
 	remoteWriteTimeout    int // s
 	remoteWriteMinWait    int // ms
 
-	h bool
-	v bool
+	h  bool
+	v  bool
+	wd bool
 
 	// pool section
 	bufPool = &pkg.ByteBufferPool{}
@@ -104,7 +105,8 @@ func initFlag() {
 	flag.IntVar(&remoteWriteTimeout, "remote_write_timeout", 5, "remote write 超时时间 (s)")
 	flag.IntVar(&remoteWriteMinWait, "remote_write_min_wait", 200, "remote write 首次重试间隔 (ms)")
 
-	flag.BoolVar(&h, "h", false, "帮助信息")
+	flag.BoolVar(&wd, "watchdog", false, "是否开启 watchDog; 开启后会自动检测后端 promes 并根据健康状态自动加入/摘除 prome 节点")
+
 	flag.BoolVar(&v, "v", false, "版本信息")
 
 	flag.Parse()
@@ -320,9 +322,11 @@ func main() {
 		IdleTimeout:       timeout,
 	}
 
-	go watchDog(ctx)
+	if wd {
+		go watchDog(ctx)
+		<-ready
+	}
 
-	<-ready
 	logrus.Warnln("prom-remote-write-shard is ready to receive traffic")
 	go serve.ListenAndServe()
 
