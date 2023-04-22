@@ -12,10 +12,12 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/hashicorp/go-retryablehttp"
 
@@ -287,20 +289,15 @@ func main() {
 				}
 			}
 
-			var (
-				key  []byte
-				hash uint32
-			)
+			var hash uint32
 			node, nh := ring.Get(buf.Bytes())
 			if rt, ok := remoteSet[node]; ok {
 				if reuse {
-					key = buf.Bytes()
 					hash = nh
 				} else {
 					toByte.Reset()
 					bufWrite(toByte, lbs)
-					key = toByte.Bytes()
-					hash = murmur3.Sum32(key)
+					hash = murmur3.Sum32(toByte.Bytes())
 				}
 
 				select {
@@ -337,6 +334,17 @@ func main() {
 	serve.Shutdown(ctx)
 	cancel()
 	wg.Wait()
+}
+
+func string2byte(s string) (b []byte) {
+	/* #nosec G103 */
+	bh := (*reflect.SliceHeader)(unsafe.Pointer(&b))
+	/* #nosec G103 */
+	sh := (*reflect.StringHeader)(unsafe.Pointer(&s))
+	bh.Data = sh.Data
+	bh.Cap = sh.Len
+	bh.Len = sh.Len
+	return b
 }
 
 func consumer(ctx context.Context, wg *sync.WaitGroup, i int, r *remote) {
