@@ -68,9 +68,10 @@ var (
 	remoteWriteTimeout    int // s
 	remoteWriteMinWait    int // ms
 
-	h  bool
-	v  bool
-	wd bool
+	h              bool
+	v              bool
+	wd             bool
+	forceUseSelfTS bool
 
 	// pool section
 	bufPool = &pkg.ByteBufferPool{}
@@ -108,6 +109,7 @@ func initFlag() {
 	flag.IntVar(&remoteWriteMinWait, "remote_write_min_wait", 200, "remote write 首次重试间隔 (ms)")
 
 	flag.BoolVar(&wd, "watchdog", false, "是否开启 watchDog; 开启后会自动检测后端 promes 并根据健康状态自动加入/摘除 prome 节点")
+	flag.BoolVar(&forceUseSelfTS, "force_use_self_ts", false, "是否将 series 强制设置为自身时间戳")
 
 	flag.BoolVar(&v, "v", false, "版本信息")
 
@@ -367,7 +369,11 @@ func consumer(ctx context.Context, wg *sync.WaitGroup, i int, r *remote) {
 		}()
 
 		// copy
+		selfTS := time.Now().UnixMilli()
 		for idx := range r.containers[shard] {
+			if forceUseSelfTS {
+				r.containers[shard][idx].Samples[0].Timestamp = selfTS
+			}
 			c = append(c, *r.containers[shard][idx])
 		}
 
