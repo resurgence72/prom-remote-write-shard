@@ -5,7 +5,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"net/http"
 	"net/http/pprof"
@@ -13,14 +12,15 @@ import (
 	"os"
 	"os/signal"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/hashicorp/go-retryablehttp"
-
 	"prom-remote-write-shard/pkg"
 
 	"github.com/gogo/protobuf/proto"
@@ -29,11 +29,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/sirupsen/logrus"
-	"github.com/spaolacci/murmur3"
 )
 
 const (
-	version = "v0.0.3"
+	version = "v0.0.4"
 
 	MetricShardKey = "metric"
 	SeriesShardKey = "series"
@@ -52,7 +51,8 @@ type remote struct {
 }
 
 var (
-	ring *pkg.Map
+	//ring *pkg.Map
+	ch *pkg.ConsistentHash
 
 	// flag section
 	promes        string
@@ -99,7 +99,7 @@ func initFlag() {
 	flag.StringVar(&shardKey, "shard_key", "series", "根据什么来分片,metric/series")
 	flag.StringVar(&addr, "listen", "0.0.0.0:9999", "http监听地址")
 	flag.StringVar(&remotePath, "remote_path", "/api/v1/receive", "组件接收remote write的 http path")
-	flag.StringVar(&hashAlgorithm, "hash_algorithm", "murmur3", "一致性哈希算法")
+	//flag.StringVar(&hashAlgorithm, "hash_algorithm", "murmur3", "一致性哈希算法")
 
 	flag.IntVar(&batch, "batch", 5000, "批量发送大小")
 	flag.IntVar(&shard, "shard", 2, "每个remote write的分片数,必须为2的n次方")
@@ -134,21 +134,19 @@ func main() {
 	}
 
 	// 保证shard为2的n次方
-	if !func() bool {
-		return shard > 0 && (shard&(shard-1)) == 0
-	}() {
+	if !(shard > 0 && (shard&(shard-1)) == 0) {
 		logrus.Fatalln("shard has to be 2 to the n power")
 	}
 
-	switch hashAlgorithm {
-	case MURMUR3Hash:
-		ring = pkg.New()
-	case CRC323Hash:
-		ring = pkg.New(pkg.WithCRC32Hash(crc32.ChecksumIEEE))
-	default:
-		logrus.Fatalln("hash algorithm not support, only support murmur3 or crc32 algorithm")
-	}
-	logrus.Warnf("prom-remote-write-shard used [%s] hash algorithm", hashAlgorithm)
+	//switch hashAlgorithm {
+	//case MURMUR3Hash:
+	//	ring = pkg.New()
+	//case CRC323Hash:
+	//	ring = pkg.New(pkg.WithCRC32Hash(crc32.ChecksumIEEE))
+	//default:
+	//	logrus.Fatalln("hash algorithm not support, only support murmur3 or crc32 algorithm")
+	//}
+	//logrus.Warnf("prom-remote-write-shard used [%s] hash algorithm", hashAlgorithm)
 
 	switch shardKey {
 	case MetricShardKey:
@@ -165,16 +163,20 @@ func main() {
 	alive = make(map[string]struct{}, len(ps))
 	lose = make(map[string]struct{}, len(ps))
 
+	var nodes []string
 	for _, p := range ps {
 		_, err := url.ParseRequestURI(p)
 		if err != nil {
 			logrus.Fatalf("remote write url [%s] parse failed: [%s]", p, err)
 		}
 
-		ring.Add(p)
+		//ring.Add(p)
+		nodes = append(nodes, p)
 		alive[p] = struct{}{}
 	}
 
+	sort.Strings(nodes)
+	ch = pkg.NewConsistentHash(nodes, 0)
 	ctx, cancel := context.WithCancel(context.TODO())
 
 	var wg sync.WaitGroup
@@ -291,19 +293,21 @@ func main() {
 				}
 			}
 
-			var hash uint32
-			node, nh := ring.Get(buf.Bytes())
-			if rt, ok := remoteSet[node]; ok {
+			var (
+				hash, nh uint64
+			)
+			nh = xxhash.Sum64(buf.Bytes())
+			if rt, ok := remoteSet[nodes[ch.GetNodeIdx(nh, nil)]]; ok {
 				if reuse {
 					hash = nh
 				} else {
 					toByte.Reset()
 					bufWrite(toByte, lbs)
-					hash = murmur3.Sum32(toByte.Bytes())
+					hash = xxhash.Sum64(toByte.Bytes())
 				}
 
 				select {
-				case rt.seriesChs[hash&uint32(shard-1)] <- &ts:
+				case rt.seriesChs[hash&uint64(shard-1)] <- &ts:
 				default:
 					promRWShardSeriesDropCounter.Inc()
 				}
@@ -502,14 +506,16 @@ func watchDog(ctx context.Context) {
 
 func reHash() {
 	m.Lock()
-	var s []string
-	for a := range alive {
-		s = append(s, a)
-	}
-	m.Unlock()
+	defer m.Unlock()
 
-	ring.ReHash(s...)
-	logrus.Warnf("now hash ring has [%d] nodes", len(alive))
+	var nodes []string
+	for a := range alive {
+		nodes = append(nodes, a)
+	}
+
+	sort.Strings(nodes)
+	ch = pkg.NewConsistentHash(nodes, 0)
+	logrus.Warnf("now hash ring has [%d] nodes: %s", len(alive), strings.Join(nodes, ","))
 }
 
 func online(addr string) {
