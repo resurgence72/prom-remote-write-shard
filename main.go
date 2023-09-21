@@ -21,7 +21,9 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/hashicorp/go-retryablehttp"
+	"github.com/prometheus/prometheus/model/labels"
 	"prom-remote-write-shard/pkg"
+	"prom-remote-write-shard/pkg/bloomfilter"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
@@ -32,7 +34,7 @@ import (
 )
 
 const (
-	version = "v0.0.4"
+	version = "v0.0.5"
 
 	MetricShardKey = "metric"
 	SeriesShardKey = "series"
@@ -68,6 +70,9 @@ var (
 	remoteWriteTimeout    int // s
 	remoteWriteMinWait    int // ms
 
+	maxHourlySeries int
+	maxDailySeries  int
+
 	h              bool
 	v              bool
 	wd             bool
@@ -82,10 +87,22 @@ var (
 		return &bytes.Buffer{}
 	}}
 
+	// bloomfilter
+	hourlySeriesLimiter *bloomfilter.Limiter
+	dailySeriesLimiter  *bloomfilter.Limiter
+
 	// prometheus section
 	promRWShardSeriesDropCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "prom_rw_shard_series_drop_counter",
 		Help: "prom rw shard series drop counter",
+	})
+	promHourlySeriesLimitRowsDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "prom_rw_shard_hourly_series_limit_rows_dropped_total",
+		Help: "hourly series limit rows dropped total",
+	})
+	promDailySeriesLimitRowsDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "prom_rw_shard_daily_series_limit_rows_dropped_total",
+		Help: "daily series limit rows dropped total",
 	})
 
 	alive, lose map[string]struct{}
@@ -110,6 +127,9 @@ func initFlag() {
 
 	flag.BoolVar(&wd, "watchdog", false, "是否开启 watchDog; 开启后会自动检测后端 promes 并根据健康状态自动加入/摘除 prome 节点")
 	flag.BoolVar(&forceUseSelfTS, "force_use_self_ts", false, "是否将 series 强制设置为自身时间戳")
+
+	flag.IntVar(&maxHourlySeries, "max_hourly_series", 0, "每小时最多发送的 series 数量")
+	flag.IntVar(&maxDailySeries, "max_daily_series", 0, "每天最多发送的 series 数量")
 
 	flag.BoolVar(&v, "v", false, "版本信息")
 
@@ -138,6 +158,13 @@ func main() {
 		logrus.Fatalln("shard has to be 2 to the n power")
 	}
 
+	if maxHourlySeries > 0 {
+		hourlySeriesLimiter = bloomfilter.NewLimiter(maxHourlySeries, time.Hour)
+	}
+	if maxDailySeries > 0 {
+		dailySeriesLimiter = bloomfilter.NewLimiter(maxDailySeries, 24*time.Hour)
+	}
+
 	//switch hashAlgorithm {
 	//case MURMUR3Hash:
 	//	ring = pkg.New()
@@ -158,6 +185,8 @@ func main() {
 
 	// register prom metrics
 	prometheus.Register(promRWShardSeriesDropCounter)
+	prometheus.Register(promHourlySeriesLimitRowsDropped)
+	prometheus.Register(promDailySeriesLimitRowsDropped)
 
 	ps := strings.Split(promes, ",")
 	alive = make(map[string]struct{}, len(ps))
@@ -267,11 +296,15 @@ func main() {
 			builderPool.Put(toByte)
 		}()
 
+		var metricName string
 		bufWrite := func(buf *bytes.Buffer, lbs []prompb.Label) {
 			for _, label := range lbs {
-				buf.WriteString(label.GetName())
-				buf.WriteByte('_')
-				buf.WriteString(label.GetValue())
+				name, value := label.GetName(), label.GetValue()
+				if name == labels.MetricName {
+					metricName = value
+				}
+				buf.WriteString(name)
+				buf.WriteString(value)
 			}
 		}
 
@@ -286,8 +319,10 @@ func main() {
 				reuse = true
 			case MetricShardKey:
 				for _, label := range lbs {
-					if label.GetName() == "__name__" {
-						buf.WriteString(label.GetValue())
+					name, value := label.GetName(), label.GetValue()
+					if name == labels.MetricName {
+						metricName = value
+						buf.WriteString(value)
 						break
 					}
 				}
@@ -304,6 +339,10 @@ func main() {
 					toByte.Reset()
 					bufWrite(toByte, lbs)
 					hash = xxhash.Sum64(toByte.Bytes())
+				}
+
+				if !limitSeriesCardinality(metricName, hash) {
+					continue
 				}
 
 				select {
@@ -340,6 +379,25 @@ func main() {
 	serve.Shutdown(ctx)
 	cancel()
 	wg.Wait()
+}
+
+func limitSeriesCardinality(metric string, h uint64) bool {
+	switch metric {
+	// 自身打点指标不做限制
+	case "prom_rw_shard_series_drop_counter", "prom_rw_shard_hourly_series_limit_rows_dropped_total", "prom_rw_shard_daily_series_limit_rows_dropped_total":
+		return true
+	default:
+	}
+
+	if hourlySeriesLimiter != nil && !hourlySeriesLimiter.Add(h) {
+		promHourlySeriesLimitRowsDropped.Inc()
+		return false
+	}
+	if dailySeriesLimiter != nil && !dailySeriesLimiter.Add(h) {
+		promDailySeriesLimitRowsDropped.Inc()
+		return false
+	}
+	return true
 }
 
 func string2byte(s string) (b []byte) {
