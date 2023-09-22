@@ -34,13 +34,10 @@ import (
 )
 
 const (
-	version = "v0.0.5"
+	version = "v0.0.6"
 
 	MetricShardKey = "metric"
 	SeriesShardKey = "series"
-
-	MURMUR3Hash = "murmur3"
-	CRC323Hash  = "crc32"
 )
 
 type remote struct {
@@ -53,7 +50,6 @@ type remote struct {
 }
 
 var (
-	//ring *pkg.Map
 	ch *pkg.ConsistentHash
 
 	// flag section
@@ -116,7 +112,6 @@ func initFlag() {
 	flag.StringVar(&shardKey, "shard_key", "series", "根据什么来分片,metric/series")
 	flag.StringVar(&addr, "listen", "0.0.0.0:9999", "http监听地址")
 	flag.StringVar(&remotePath, "remote_path", "/api/v1/receive", "组件接收remote write的 http path")
-	//flag.StringVar(&hashAlgorithm, "hash_algorithm", "murmur3", "一致性哈希算法")
 
 	flag.IntVar(&batch, "batch", 5000, "批量发送大小")
 	flag.IntVar(&shard, "shard", 2, "每个remote write的分片数,必须为2的n次方")
@@ -165,16 +160,6 @@ func main() {
 		dailySeriesLimiter = bloomfilter.NewLimiter(maxDailySeries, 24*time.Hour)
 	}
 
-	//switch hashAlgorithm {
-	//case MURMUR3Hash:
-	//	ring = pkg.New()
-	//case CRC323Hash:
-	//	ring = pkg.New(pkg.WithCRC32Hash(crc32.ChecksumIEEE))
-	//default:
-	//	logrus.Fatalln("hash algorithm not support, only support murmur3 or crc32 algorithm")
-	//}
-	//logrus.Warnf("prom-remote-write-shard used [%s] hash algorithm", hashAlgorithm)
-
 	switch shardKey {
 	case MetricShardKey:
 	case SeriesShardKey:
@@ -199,7 +184,6 @@ func main() {
 			logrus.Fatalf("remote write url [%s] parse failed: [%s]", p, err)
 		}
 
-		//ring.Add(p)
 		nodes = append(nodes, p)
 		alive[p] = struct{}{}
 	}
@@ -211,15 +195,6 @@ func main() {
 	var wg sync.WaitGroup
 	remoteSet := make(map[string]*remote, len(ps))
 	for i, prom := range ps {
-		//client, _ := api.NewClient(api.Config{
-		//	Address: prom,
-		//	RoundTripper: &http.Transport{
-		//		DialContext: (&net.Dialer{
-		//			Timeout:   15 * time.Second,
-		//			KeepAlive: 15 * time.Second,
-		//		}).DialContext,
-		//	},
-		//})
 		client := retryWithBackOff(
 			remoteWriteRetryTimes,
 			time.Duration(remoteWriteMinWait)*time.Millisecond,
@@ -287,64 +262,45 @@ func main() {
 			return
 		}
 
-		buf := builderPool.Get().(*bytes.Buffer)
-		toByte := builderPool.Get().(*bytes.Buffer)
-		defer func() {
-			buf.Reset()
-			toByte.Reset()
-			builderPool.Put(buf)
-			builderPool.Put(toByte)
-		}()
-
 		var metricName string
-		bufWrite := func(buf *bytes.Buffer, lbs []prompb.Label) {
+		getLabelsHash := func(lbs []prompb.Label) uint64 {
+			bb := bufPool.Get()
+			b := bb.B[:0]
 			for _, label := range lbs {
 				name, value := label.GetName(), label.GetValue()
 				if name == labels.MetricName {
 					metricName = value
 				}
-				buf.WriteString(name)
-				buf.WriteString(value)
+
+				b = append(b, label.Name...)
+				b = append(b, label.Value...)
 			}
+			h := xxhash.Sum64(b)
+			bb.B = b
+			bufPool.Put(bb)
+			return h
 		}
 
-		for i := range req.Timeseries {
+		for i := 0; i < len(req.Timeseries); i++ {
 			ts := req.Timeseries[i]
-			reuse := false
 			lbs := ts.GetLabels()
 
+			var hash uint64
 			switch shardKey {
 			case SeriesShardKey:
-				bufWrite(buf, lbs)
-				reuse = true
+				hash = getLabelsHash(lbs)
 			case MetricShardKey:
 				for _, label := range lbs {
 					name, value := label.GetName(), label.GetValue()
 					if name == labels.MetricName {
 						metricName = value
-						buf.WriteString(value)
+						hash = xxhash.Sum64String(value)
 						break
 					}
 				}
 			}
 
-			var (
-				hash, nh uint64
-			)
-			nh = xxhash.Sum64(buf.Bytes())
-			if rt, ok := remoteSet[nodes[ch.GetNodeIdx(nh, nil)]]; ok {
-				if reuse {
-					hash = nh
-				} else {
-					toByte.Reset()
-					bufWrite(toByte, lbs)
-					hash = xxhash.Sum64(toByte.Bytes())
-				}
-
-				if !limitSeriesCardinality(metricName, hash) {
-					continue
-				}
-
+			if rt, ok := remoteSet[nodes[ch.GetNodeIdx(hash, nil)]]; ok && limitSeriesCardinality(metricName, hash) {
 				select {
 				case rt.seriesChs[hash&uint64(shard-1)] <- &ts:
 				default:
