@@ -79,9 +79,6 @@ var (
 	tsPool  = sync.Pool{New: func() any {
 		return make([]prompb.TimeSeries, 0)
 	}}
-	builderPool = sync.Pool{New: func() any {
-		return &bytes.Buffer{}
-	}}
 
 	// bloomfilter
 	hourlySeriesLimiter *bloomfilter.Limiter
