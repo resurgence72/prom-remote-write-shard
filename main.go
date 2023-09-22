@@ -11,13 +11,12 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/hashicorp/go-retryablehttp"
@@ -36,8 +35,10 @@ import (
 const (
 	version = "v0.0.6"
 
-	MetricShardKey = "metric"
-	SeriesShardKey = "series"
+	metricShardKey = "metric"
+	seriesShardKey = "series"
+
+	namespace = "prws"
 )
 
 type remote struct {
@@ -85,18 +86,28 @@ var (
 	dailySeriesLimiter  *bloomfilter.Limiter
 
 	// prometheus section
-	promRWShardSeriesDropCounter = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prom_rw_shard_series_drop_counter",
-		Help: "prom rw shard series drop counter",
+	seriesKeepCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "series_keep_total",
+		Help:      "series keep total",
 	})
-	promHourlySeriesLimitRowsDropped = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prom_rw_shard_hourly_series_limit_rows_dropped_total",
-		Help: "hourly series limit rows dropped total",
+	seriesDropCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "series_drop_total",
+		Help:      "series drop total",
 	})
-	promDailySeriesLimitRowsDropped = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prom_rw_shard_daily_series_limit_rows_dropped_total",
-		Help: "daily series limit rows dropped total",
+	hourlySeriesLimitRowsDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "hourly_series_limit_rows_drop_total",
+		Help:      "hourly series limit rows drop total",
 	})
+	dailySeriesLimitRowsDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "daily_series_limit_rows_drop_total",
+		Help:      "daily series limit rows drop total",
+	})
+
+	namespaceRegexp = regexp.MustCompile("^" + namespace)
 
 	alive, lose map[string]struct{}
 	ready       = make(chan struct{})
@@ -158,17 +169,18 @@ func main() {
 	}
 
 	switch shardKey {
-	case MetricShardKey:
-	case SeriesShardKey:
+	case metricShardKey:
+	case seriesShardKey:
 	default:
 		logrus.Fatalln("shardKey not support, only support metric or series")
 	}
 	logrus.Warnf("prom-remote-write-shard used [%s] shard key", shardKey)
 
 	// register prom metrics
-	prometheus.Register(promRWShardSeriesDropCounter)
-	prometheus.Register(promHourlySeriesLimitRowsDropped)
-	prometheus.Register(promDailySeriesLimitRowsDropped)
+	prometheus.Register(seriesKeepCounter)
+	prometheus.Register(seriesDropCounter)
+	prometheus.Register(hourlySeriesLimitRowsDropped)
+	prometheus.Register(dailySeriesLimitRowsDropped)
 
 	ps := strings.Split(promes, ",")
 	alive = make(map[string]struct{}, len(ps))
@@ -284,9 +296,9 @@ func main() {
 
 			var hash uint64
 			switch shardKey {
-			case SeriesShardKey:
+			case seriesShardKey:
 				hash = getLabelsHash(lbs)
-			case MetricShardKey:
+			case metricShardKey:
 				for _, label := range lbs {
 					name, value := label.GetName(), label.GetValue()
 					if name == labels.MetricName {
@@ -300,8 +312,9 @@ func main() {
 			if rt, ok := remoteSet[nodes[ch.GetNodeIdx(hash, nil)]]; ok && limitSeriesCardinality(metricName, hash) {
 				select {
 				case rt.seriesChs[hash&uint64(shard-1)] <- &ts:
+					seriesKeepCounter.Inc()
 				default:
-					promRWShardSeriesDropCounter.Inc()
+					seriesDropCounter.Inc()
 				}
 			}
 		}
@@ -335,33 +348,20 @@ func main() {
 }
 
 func limitSeriesCardinality(metric string, h uint64) bool {
-	switch metric {
-	// 自身打点指标不做限制
-	case "prom_rw_shard_series_drop_counter", "prom_rw_shard_hourly_series_limit_rows_dropped_total", "prom_rw_shard_daily_series_limit_rows_dropped_total":
+	if namespaceRegexp.MatchString(metric) {
+		// 自身打点指标不做限制
 		return true
-	default:
 	}
 
 	if hourlySeriesLimiter != nil && !hourlySeriesLimiter.Add(h) {
-		promHourlySeriesLimitRowsDropped.Inc()
+		hourlySeriesLimitRowsDropped.Inc()
 		return false
 	}
 	if dailySeriesLimiter != nil && !dailySeriesLimiter.Add(h) {
-		promDailySeriesLimitRowsDropped.Inc()
+		dailySeriesLimitRowsDropped.Inc()
 		return false
 	}
 	return true
-}
-
-func string2byte(s string) (b []byte) {
-	/* #nosec G103 */
-	bh := (*reflect.SliceHeader)(unsafe.Pointer(&b))
-	/* #nosec G103 */
-	sh := (*reflect.StringHeader)(unsafe.Pointer(&s))
-	bh.Data = sh.Data
-	bh.Cap = sh.Len
-	bh.Len = sh.Len
-	return b
 }
 
 func consumer(ctx context.Context, wg *sync.WaitGroup, i int, r *remote) {
