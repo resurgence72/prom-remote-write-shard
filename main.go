@@ -21,6 +21,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/prometheus/prometheus/model/labels"
+
 	"prom-remote-write-shard/pkg"
 	"prom-remote-write-shard/pkg/bloomfilter"
 
@@ -281,8 +282,8 @@ func main() {
 					metricName = value
 				}
 
-				b = append(b, label.Name...)
-				b = append(b, label.Value...)
+				b = append(b, name...)
+				b = append(b, value...)
 			}
 			h := xxhash.Sum64(b)
 			bb.B = b
