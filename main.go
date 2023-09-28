@@ -34,7 +34,7 @@ import (
 )
 
 const (
-	version = "v0.0.6"
+	version = "v0.0.7"
 
 	metricShardKey = "metric"
 	seriesShardKey = "series"
@@ -55,11 +55,13 @@ var (
 	ch *pkg.ConsistentHash
 
 	// flag section
-	promes        string
-	shardKey      string
-	addr          string
-	remotePath    string
-	hashAlgorithm string
+	promes     string
+	shardKey   string
+	addr       string
+	remotePath string
+
+	externalLabelsStr string
+	externalLabels    map[string]string
 
 	batch int
 	shard int
@@ -121,6 +123,7 @@ func initFlag() {
 	flag.StringVar(&shardKey, "shard_key", "series", "根据什么来分片,metric/series")
 	flag.StringVar(&addr, "listen", "0.0.0.0:9999", "http监听地址")
 	flag.StringVar(&remotePath, "remote_path", "/api/v1/receive", "组件接收remote write的 http path")
+	flag.StringVar(&externalLabelsStr, "external_labels", "", "添加 external_labels; env=prod,app=prom-remote-write-shard")
 
 	flag.IntVar(&batch, "batch", 5000, "批量发送大小")
 	flag.IntVar(&shard, "shard", 2, "每个remote write的分片数,必须为2的n次方")
@@ -160,6 +163,13 @@ func main() {
 	// 保证shard为2的n次方
 	if !(shard > 0 && (shard&(shard-1)) == 0) {
 		logrus.Fatalln("shard has to be 2 to the n power")
+	}
+
+	externalLabels = make(map[string]string)
+	for _, labelkv := range strings.Split(externalLabelsStr, ",") {
+		if kv := strings.Split(labelkv, "="); len(kv) == 2 {
+			externalLabels[kv[0]] = kv[1]
+		}
 	}
 
 	if maxHourlySeries > 0 {
@@ -282,8 +292,8 @@ func main() {
 					metricName = value
 				}
 
-				b = append(b, name...)
-				b = append(b, value...)
+				b = append(b, label.Name...)
+				b = append(b, label.Value...)
 			}
 			h := xxhash.Sum64(b)
 			bb.B = b
@@ -389,6 +399,16 @@ func consumer(ctx context.Context, wg *sync.WaitGroup, i int, r *remote) {
 		for idx := range r.containers[shard] {
 			if forceUseSelfTS {
 				r.containers[shard][idx].Samples[0].Timestamp = selfTS
+			}
+
+			// add external labels
+			if len(externalLabels) > 0 {
+				for ek, ev := range externalLabels {
+					r.containers[shard][idx].Labels = append(r.containers[shard][idx].Labels, prompb.Label{
+						Name:  ek,
+						Value: ev,
+					})
+				}
 			}
 			c = append(c, *r.containers[shard][idx])
 		}
