@@ -459,6 +459,18 @@ func retryWithBackOff(retry int, minWait, timeout time.Duration) *http.Client {
 	retryClient.RetryMax = retry
 	retryClient.RetryWaitMin = minWait
 	retryClient.HTTPClient.Timeout = timeout
+	retryClient.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
+		// 如果响应码为 2xx 则不重试
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return false, nil
+		}
+
+		// 如果响应码 >= 500 或为 400 则不重试
+		if resp.StatusCode >= 500 || resp.StatusCode == 400 {
+			return false, nil
+		}
+		return true, nil
+	}
 	retryClient.Logger = nil
 	return retryClient.StandardClient()
 }
