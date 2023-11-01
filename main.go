@@ -460,6 +460,10 @@ func retryWithBackOff(retry int, minWait, timeout time.Duration) *http.Client {
 	retryClient.RetryWaitMin = minWait
 	retryClient.HTTPClient.Timeout = timeout
 	retryClient.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
+		if err != nil {
+			return false, err
+		}
+
 		// 如果响应码为 2xx 则不重试
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return false, nil
@@ -592,9 +596,10 @@ func isHealthy(addr string) bool {
 		100*time.Millisecond,
 		time.Second,
 	).Do(req)
-	if err == nil && resp.StatusCode == 200 {
-		defer clean(resp)
-		return true
+	if err != nil {
+		return false
 	}
-	return false
+
+	defer clean(resp)
+	return resp.StatusCode == 200
 }
