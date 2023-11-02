@@ -1,19 +1,16 @@
 module prom-remote-write-shard
 
-go 1.21
-
-require (
-	github.com/golang/snappy v0.0.4
-	github.com/prometheus/prometheus v0.47.0
-	github.com/spaolacci/murmur3 v1.1.0
-)
+go 1.21.0
 
 require (
 	github.com/cespare/xxhash/v2 v2.2.0
 	github.com/gogo/protobuf v1.3.2
+	github.com/golang/snappy v0.0.4
 	github.com/hashicorp/go-retryablehttp v0.7.4
 	github.com/prometheus/client_golang v1.16.0
-	github.com/sirupsen/logrus v1.8.1
+	github.com/prometheus/prometheus v0.47.0
+	github.com/sirupsen/logrus v1.9.3
+	github.com/spaolacci/murmur3 v1.1.0
 )
 
 require (
