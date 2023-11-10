@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -34,7 +33,7 @@ import (
 )
 
 const (
-	version = "v0.0.7"
+	version = "v0.0.8"
 
 	metricShardKey = "metric"
 	seriesShardKey = "series"
@@ -73,6 +72,8 @@ var (
 	maxHourlySeries int
 	maxDailySeries  int
 
+	replicaFactor int
+
 	h              bool
 	v              bool
 	wd             bool
@@ -110,8 +111,6 @@ var (
 		Help:      "daily series limit rows drop total",
 	})
 
-	namespaceRegexp = regexp.MustCompile("^" + namespace)
-
 	alive, lose map[string]struct{}
 	ready       = make(chan struct{})
 
@@ -137,6 +136,7 @@ func initFlag() {
 
 	flag.IntVar(&maxHourlySeries, "max_hourly_series", 0, "每小时最多发送的 series 数量")
 	flag.IntVar(&maxDailySeries, "max_daily_series", 0, "每天最多发送的 series 数量")
+	flag.IntVar(&replicaFactor, "replica_factor", 1, "数据转发的副本数, 通常小于等于后端节点数")
 
 	flag.BoolVar(&v, "v", false, "版本信息")
 
@@ -209,7 +209,7 @@ func main() {
 	}
 
 	sort.Strings(nodes)
-	ch = pkg.NewConsistentHash(nodes, 0)
+	ch = pkg.NewConsistentHash(nodes, replicaFactor, 0)
 	ctx, cancel := context.WithCancel(context.TODO())
 
 	var wg sync.WaitGroup
@@ -277,7 +277,7 @@ func main() {
 		}
 
 		var req prompb.WriteRequest
-		if err := proto.Unmarshal(bb.B, &req); err != nil {
+		if err = proto.Unmarshal(bb.B, &req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -320,12 +320,18 @@ func main() {
 				}
 			}
 
-			if rt, ok := remoteSet[nodes[ch.GetNodeIdx(hash, nil)]]; ok && limitSeriesCardinality(metricName, hash) {
-				select {
-				case rt.seriesChs[hash&uint64(shard-1)] <- &ts:
-					seriesKeepCounter.Inc()
-				default:
-					seriesDropCounter.Inc()
+			if !limitSeriesCardinality(metricName, hash) {
+				continue
+			}
+
+			for _, idx := range ch.GetReplicaNodeIdx(hash, nil) {
+				if rt, ok := remoteSet[nodes[idx]]; ok {
+					select {
+					case rt.seriesChs[hash&uint64(shard-1)] <- &ts:
+						seriesKeepCounter.Inc()
+					default:
+						seriesDropCounter.Inc()
+					}
 				}
 			}
 		}
@@ -359,8 +365,8 @@ func main() {
 }
 
 func limitSeriesCardinality(metric string, h uint64) bool {
-	if namespaceRegexp.MatchString(metric) {
-		// 自身打点指标不做限制
+	// 自身打点指标不做限制
+	if len(metric) > len(namespace) && metric[:len(namespace)] == namespace {
 		return true
 	}
 
@@ -562,7 +568,7 @@ func reHash() {
 	}
 
 	sort.Strings(nodes)
-	ch = pkg.NewConsistentHash(nodes, 0)
+	ch = pkg.NewConsistentHash(nodes, replicaFactor, 0)
 	logrus.Warnf("now hash ring has [%d] nodes: %s", len(alive), strings.Join(nodes, ","))
 }
 
