@@ -3,9 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
-	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/pprof"
 	"net/url"
@@ -20,6 +20,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/prometheus/prometheus/model/labels"
+	flag "github.com/spf13/pflag"
 
 	"prom-remote-write-shard/pkg"
 	"prom-remote-write-shard/pkg/bloomfilter"
@@ -29,7 +30,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/prometheus/prompb"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -117,8 +117,14 @@ var (
 	m sync.Mutex
 )
 
+func initLog() {
+	handler := slog.NewTextHandler(os.Stdout, nil)
+	l := slog.New(handler)
+	slog.SetDefault(l)
+}
+
 func initFlag() {
-	flag.StringVar(&promes, "promes", "http://localhost:9090/api/v1/write", "prometheus地址，多台使用 `,` 逗号分割")
+	flag.StringVar(&promes, "promes", "", "prometheus地址，多台使用 , 分割")
 	flag.StringVar(&shardKey, "shard_key", "series", "根据什么来分片,metric/series")
 	flag.StringVar(&addr, "listen", "0.0.0.0:9999", "http监听地址")
 	flag.StringVar(&remotePath, "remote_path", "/api/v1/receive", "组件接收remote write的 http path")
@@ -148,21 +154,24 @@ func initFlag() {
 	}
 
 	if v {
-		logrus.Warnln("version", version)
+		slog.Warn("prom-remote-write-shard version", slog.String("version", version))
 		os.Exit(0)
 	}
 }
 
 func main() {
+	initLog()
 	initFlag()
 
 	if len(promes) == 0 || len(strings.Split(promes, ",")) == 0 {
-		logrus.Fatalln("promes can not be empty")
+		slog.Error("--promes can not be empty")
+		return
 	}
 
 	// 保证shard为2的n次方
 	if !(shard > 0 && (shard&(shard-1)) == 0) {
-		logrus.Fatalln("shard has to be 2 to the n power")
+		slog.Error("--shard has to be 2 to the n power")
+		return
 	}
 
 	externalLabels = make(map[string]string)
@@ -183,9 +192,10 @@ func main() {
 	case metricShardKey:
 	case seriesShardKey:
 	default:
-		logrus.Fatalln("shardKey not support, only support metric or series")
+		slog.Error("--shard_key not support, only support metric or series", slog.String("shard_key", shardKey))
+		return
 	}
-	logrus.Warnf("prom-remote-write-shard used [%s] shard key", shardKey)
+	slog.Warn("shard key", slog.String("shard_key", shardKey))
 
 	// register prom metrics
 	prometheus.Register(seriesKeepCounter)
@@ -201,7 +211,7 @@ func main() {
 	for _, p := range ps {
 		_, err := url.ParseRequestURI(p)
 		if err != nil {
-			logrus.Fatalf("remote write url [%s] parse failed: [%s]", p, err)
+			slog.Error("remote write url parse failed", slog.String("url", p), slog.String("error", err.Error()))
 		}
 
 		nodes = append(nodes, p)
@@ -352,7 +362,7 @@ func main() {
 		<-ready
 	}
 
-	logrus.Warnln("prom-remote-write-shard is ready to receive traffic")
+	slog.Warn("prom-remote-write-shard is ready to receive traffic")
 	go serve.ListenAndServe()
 
 	quit := make(chan os.Signal, 1)
@@ -362,6 +372,8 @@ func main() {
 	serve.Shutdown(ctx)
 	cancel()
 	wg.Wait()
+
+	slog.Warn("prom-remote-write-shard exit")
 }
 
 func limitSeriesCardinality(metric string, h uint64) bool {
@@ -382,13 +394,17 @@ func limitSeriesCardinality(metric string, h uint64) bool {
 }
 
 func consumer(ctx context.Context, wg *sync.WaitGroup, i int, r *remote) {
-	logrus.Warnf("consumer [%d] start [%s], shards [%d] for pre consumer", i, r.addr, r.shard)
+	slog.Warn("consumer start", slog.Int("consumer", i), slog.String("addr", r.addr), slog.Int("shard", r.shard))
 
 	report := func(shard int) {
 		if len(r.containers[shard]) == 0 {
 			return
 		}
-		logrus.Warnf("consumer [%d] - shard [%d] start report series, len [%d]", i, shard, len(r.containers[shard]))
+		slog.Warn("consumer shard report series",
+			slog.Int("consumer", i),
+			slog.Int("shard", shard),
+			slog.Int("seriesLens", len(r.containers[shard])),
+		)
 		defer func() {
 			// re-slice
 			r.containers[shard] = r.containers[shard][:0]
@@ -424,7 +440,7 @@ func consumer(ctx context.Context, wg *sync.WaitGroup, i int, r *remote) {
 
 		marshal, err := proto.Marshal(&prompb.WriteRequest{Timeseries: c})
 		if err != nil {
-			logrus.Errorln("send series proto marshal failed", err)
+			slog.Error("send series proto marshal failed", slog.String("error", err.Error()))
 			return
 		}
 
@@ -481,7 +497,7 @@ func retryWithBackOff(retry int, minWait, timeout time.Duration) *http.Client {
 		}
 		return true, nil
 	}
-	retryClient.Logger = nil
+	retryClient.Logger = slog.Default()
 	return retryClient.StandardClient()
 }
 
@@ -498,14 +514,14 @@ func send(r *remote, req []byte) {
 
 	resp, err := r.api.Do(httpReq)
 	if err != nil {
-		logrus.Errorln("api do failed", err)
+		slog.Error("http do failed", slog.String("error", err.Error()))
 		return
 	}
 	defer clean(resp)
 
 	if resp.StatusCode >= 400 {
 		all, _ := io.ReadAll(resp.Body)
-		logrus.Errorln("api do status code >= 400", resp.StatusCode, string(all))
+		slog.Error("api do status code >= 400", slog.Int("code", resp.StatusCode), slog.String("resp", string(all)))
 		return
 	}
 }
@@ -569,13 +585,13 @@ func reHash() {
 
 	sort.Strings(nodes)
 	ch = pkg.NewConsistentHash(nodes, replicaFactor, 0)
-	logrus.Warnf("now hash ring has [%d] nodes: %s", len(alive), strings.Join(nodes, ","))
+	slog.Warn("hash ring has changed", slog.Int("alives", len(alive)), slog.String("nodes", strings.Join(nodes, ",")))
 }
 
 func online(addr string) {
 	m.Lock()
 	defer m.Unlock()
-	logrus.Warnln("remote write online:", addr)
+	slog.Warn("remote write endpoint online", slog.String("addr", addr))
 
 	alive[addr] = struct{}{}
 	delete(lose, addr)
@@ -584,7 +600,7 @@ func online(addr string) {
 func offline(addr string) {
 	m.Lock()
 	defer m.Unlock()
-	logrus.Warnln("remote write offline:", addr)
+	slog.Warn("remote write endpoint offline:", slog.String("addr", addr))
 
 	lose[addr] = struct{}{}
 	delete(alive, addr)

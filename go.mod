@@ -1,6 +1,6 @@
 module prom-remote-write-shard
 
-go 1.21.0
+go 1.21.4
 
 require (
 	github.com/cespare/xxhash/v2 v2.2.0
@@ -9,8 +9,8 @@ require (
 	github.com/hashicorp/go-retryablehttp v0.7.4
 	github.com/prometheus/client_golang v1.16.0
 	github.com/prometheus/prometheus v0.47.0
-	github.com/sirupsen/logrus v1.9.3
 	github.com/spaolacci/murmur3 v1.1.0
+	github.com/spf13/pflag v1.0.5
 )
 
 require (
