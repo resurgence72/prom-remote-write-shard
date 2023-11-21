@@ -176,7 +176,9 @@ func main() {
 
 	externalLabels = make(map[string]string)
 	for _, labelkv := range strings.Split(externalLabelsStr, ",") {
-		if kv := strings.Split(labelkv, "="); len(kv) == 2 {
+		if kv := strings.Split(labelkv, "="); len(kv) == 2 &&
+			len(strings.TrimSpace(kv[0])) > 0 &&
+			len(strings.TrimSpace(kv[1])) > 0 {
 			externalLabels[kv[0]] = kv[1]
 		}
 	}
