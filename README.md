@@ -72,8 +72,20 @@
 > # prws 每小时活跃指标超限被drop总数
 > prws_hourly_series_limit_rows_drop_total
 > 
+> # prws 每小时实际接受的活跃指标数
+> prws_hourly_series_limit_current_series
+> 
+> # prws 每小时允许的活跃指标数
+> prws_hourly_series_max_limit
+> 
 > # prws 每天活跃指标超限被drop总数
 > prws_daily_series_limit_rows_drop_total
+> 
+> # prws 每天实际接受的活跃指标数
+> prws_daily_series_limit_current_series
+> 
+> # prws 每天允许的活跃指标数
+> prws_daily_series_max_limit
 > ```
 >
 > 项目提供 /metrics 接口供 prometheus 抓取

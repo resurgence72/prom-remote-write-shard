@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	version = "v0.0.8"
+	version = "v0.0.9"
 
 	metricShardKey = "metric"
 	seriesShardKey = "series"
@@ -100,6 +100,29 @@ var (
 		Name:      "series_drop_total",
 		Help:      "series drop total",
 	})
+
+	hourlySeriesMaxLimit = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Name:      "hourly_series_max_limit",
+		Help:      "hourly series max limit count",
+	})
+	dailySeriesMaxLimit = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Name:      "daily_series_max_limit",
+		Help:      "daily series max limit count",
+	})
+
+	hourlySeriesLimitCurrentSeries = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Name:      "hourly_series_limit_current_series",
+		Help:      "hourly series limit current series",
+	})
+	dailySeriesLimitCurrentSeries = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Name:      "daily_series_limit_current_series",
+		Help:      "daily series limit current series",
+	})
+
 	hourlySeriesLimitRowsDropped = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Name:      "hourly_series_limit_rows_drop_total",
@@ -159,9 +182,34 @@ func initFlag() {
 	}
 }
 
+func initPrometheusMetric() {
+	// register prom metrics
+	prometheus.Register(seriesKeepCounter)
+	prometheus.Register(seriesDropCounter)
+	prometheus.Register(hourlySeriesLimitRowsDropped)
+	prometheus.Register(hourlySeriesMaxLimit)
+	prometheus.Register(hourlySeriesLimitCurrentSeries)
+	prometheus.Register(dailySeriesLimitRowsDropped)
+	prometheus.Register(dailySeriesMaxLimit)
+	prometheus.Register(dailySeriesLimitCurrentSeries)
+
+	go func() {
+		for range time.After(time.Hour) {
+			hourlySeriesLimitCurrentSeries.Set(0)
+		}
+	}()
+
+	go func() {
+		for range time.After(24 * time.Hour) {
+			dailySeriesLimitCurrentSeries.Set(0)
+		}
+	}()
+}
+
 func main() {
 	initLog()
 	initFlag()
+	initPrometheusMetric()
 
 	if len(promes) == 0 || len(strings.Split(promes, ",")) == 0 {
 		slog.Error("--promes can not be empty")
@@ -189,6 +237,8 @@ func main() {
 	if maxDailySeries > 0 {
 		dailySeriesLimiter = bloomfilter.NewLimiter(maxDailySeries, 24*time.Hour)
 	}
+	hourlySeriesMaxLimit.Set(float64(maxHourlySeries))
+	dailySeriesMaxLimit.Set(float64(maxDailySeries))
 
 	switch shardKey {
 	case metricShardKey:
@@ -198,12 +248,6 @@ func main() {
 		return
 	}
 	slog.Warn("shard key", slog.String("shard_key", shardKey))
-
-	// register prom metrics
-	prometheus.Register(seriesKeepCounter)
-	prometheus.Register(seriesDropCounter)
-	prometheus.Register(hourlySeriesLimitRowsDropped)
-	prometheus.Register(dailySeriesLimitRowsDropped)
 
 	ps := strings.Split(promes, ",")
 	alive = make(map[string]struct{}, len(ps))
@@ -383,6 +427,9 @@ func limitSeriesCardinality(metric string, h uint64) bool {
 	if len(metric) > len(namespace) && metric[:len(namespace)] == namespace {
 		return true
 	}
+
+	hourlySeriesLimitCurrentSeries.Inc()
+	dailySeriesLimitCurrentSeries.Inc()
 
 	if hourlySeriesLimiter != nil && !hourlySeriesLimiter.Add(h) {
 		hourlySeriesLimitRowsDropped.Inc()
