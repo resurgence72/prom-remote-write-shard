@@ -1,4 +1,4 @@
-FROM golang:1.21-alpine as builder
+FROM golang:1.21.4-alpine as builder
 ARG APPNAME="prom-remote-write-shard"
 # 镜像设置必要的环境变量
 ENV GOPROXY=https://goproxy.cn,direct \
