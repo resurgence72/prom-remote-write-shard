@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,6 +12,8 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -30,15 +33,17 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/prometheus/prompb"
+	"github.com/resurgence72/persistentqueue"
 )
 
 const (
-	version = "v0.0.9"
+	version = "v0.1.0"
 
 	metricShardKey = "metric"
 	seriesShardKey = "series"
 
-	namespace = "prws"
+	namespace              = "prws"
+	persistentQueueDirname = "persistent-queue"
 )
 
 type remote struct {
@@ -46,6 +51,8 @@ type remote struct {
 	api        *http.Client
 	seriesChs  []chan *prompb.TimeSeries
 	containers [][]*prompb.TimeSeries
+
+	queue *persistentqueue.FastQueue
 
 	shard int
 }
@@ -78,6 +85,10 @@ var (
 	v              bool
 	wd             bool
 	forceUseSelfTS bool
+
+	persistentQueue        bool
+	persistentQueuePath    string
+	persistentQueueMaxSize int
 
 	// pool section
 	bufPool = &pkg.ByteBufferPool{}
@@ -134,6 +145,13 @@ var (
 		Help:      "daily series limit rows drop total",
 	})
 
+	remoteWriteSendDurationSeconds = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Name:      "remote_write_send_duration_seconds",
+		Help:      "remote write send duration seconds",
+		Buckets:   prometheus.ExponentialBuckets(0.00005, 2, 19),
+	})
+
 	alive, lose map[string]struct{}
 	ready       = make(chan struct{})
 
@@ -167,6 +185,10 @@ func initFlag() {
 	flag.IntVar(&maxDailySeries, "max_daily_series", 0, "每天最多发送的 series 数量")
 	flag.IntVar(&replicaFactor, "replica_factor", 1, "数据转发的副本数, 通常小于等于后端节点数")
 
+	flag.BoolVar(&persistentQueue, "persistent_queue", false, "是否开启 persistentqueue 功能")
+	flag.StringVar(&persistentQueuePath, "persistent_queue_path", "./prws_queue", "persistentqueue 目录")
+	flag.IntVar(&persistentQueueMaxSize, "persistent_queue_max_size", 5*1024*1024*1024, "每个 persistentqueue 的最大容量")
+
 	flag.BoolVar(&v, "v", false, "版本信息")
 
 	flag.Parse()
@@ -192,6 +214,7 @@ func initPrometheusMetric() {
 	prometheus.Register(dailySeriesLimitRowsDropped)
 	prometheus.Register(dailySeriesMaxLimit)
 	prometheus.Register(dailySeriesLimitCurrentSeries)
+	prometheus.Register(remoteWriteSendDurationSeconds)
 
 	go func() {
 		for range time.After(time.Hour) {
@@ -231,6 +254,13 @@ func main() {
 		}
 	}
 
+	//if persistentQueue {
+	//	if err := os.RemoveAll(persistentQueuePath); err != nil {
+	//		slog.Error("remove persistentQueuePath", slog.String("persistentQueuePath", persistentQueuePath), slog.String("error", err.Error()))
+	//		return
+	//	}
+	//}
+
 	if maxHourlySeries > 0 {
 		hourlySeriesLimiter = bloomfilter.NewLimiter(maxHourlySeries, time.Hour)
 	}
@@ -266,10 +296,10 @@ func main() {
 
 	sort.Strings(nodes)
 	ch = pkg.NewConsistentHash(nodes, replicaFactor, 0)
-	ctx, cancel := context.WithCancel(context.TODO())
+	ctx, cancel := context.WithCancel(context.Background())
 
-	var wg sync.WaitGroup
 	remoteSet := make(map[string]*remote, len(ps))
+	existingQueues := make(map[string]struct{}, len(ps))
 	for i, prom := range ps {
 		client := retryWithBackOff(
 			remoteWriteRetryTimes,
@@ -294,8 +324,58 @@ func main() {
 			shard:      shard,
 		}
 
+		if persistentQueue {
+			queuePath := filepath.Join(persistentQueuePath, persistentQueueDirname, fmt.Sprintf("%d_%016X", i+1, xxhash.Sum64([]byte(prom))))
+			sanitizedURL := fmt.Sprintf("%d:%s", i+1, prom)
+			maxInmemoryBlocks := 100 * runtime.GOMAXPROCS(-1) * 2
+			maxPendingBytes := persistentQueueMaxSize
+			fq := persistentqueue.MustOpenFastQueue(
+				queuePath,
+				sanitizedURL,
+				maxInmemoryBlocks,
+				int64(maxPendingBytes),
+			)
+			existingQueues[fq.Dirname()] = struct{}{}
+
+			r.queue = fq
+		}
 		remoteSet[prom] = r
+	}
+
+	if persistentQueue {
+		queuesDir := filepath.Join(persistentQueuePath, persistentQueueDirname)
+		files, err := os.ReadDir(queuesDir)
+		if err != nil {
+			slog.Error("read queues dir failed", slog.String("dir", queuesDir), slog.String("error", err.Error()))
+			return
+		}
+		for _, f := range files {
+			dirname := f.Name()
+			if _, ok := existingQueues[dirname]; ok {
+				continue
+			}
+
+			fullPath := filepath.Join(queuesDir, dirname)
+			if err = os.RemoveAll(fullPath); err != nil {
+				slog.Error("remove queues dir failed", slog.String("dir", fullPath), slog.String("error", err.Error()))
+				return
+			}
+		}
+	}
+
+	var (
+		i  int
+		wg sync.WaitGroup
+	)
+
+	for prom := range remoteSet {
+		r := remoteSet[prom]
 		go consumer(ctx, &wg, i, r)
+		i++
+
+		if persistentQueue {
+			go consumerWithQueue(ctx, &wg, r)
+		}
 	}
 
 	read := func(r *http.Request, bb *pkg.ByteBuffer) error {
@@ -415,11 +495,69 @@ func main() {
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
 
-	serve.Shutdown(ctx)
 	cancel()
+	serve.Shutdown(ctx)
 	wg.Wait()
 
 	slog.Warn("prom-remote-write-shard exit")
+}
+
+func consumerWithQueue(ctx context.Context, wg *sync.WaitGroup, r *remote) {
+	var (
+		block []byte
+		ok    bool
+	)
+	wg.Add(1)
+
+	quitCh := make(chan struct{})
+	defer func() {
+		r.queue.MustClose()
+		wg.Done()
+		<-quitCh
+	}()
+
+	readCh := make(chan []byte)
+	go func() {
+		defer func() {
+			close(readCh)
+			close(quitCh)
+		}()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			block, ok = r.queue.MustReadBlock(block[:0])
+			if !ok {
+				return
+			}
+			readCh <- block
+		}
+	}()
+
+	errCh := make(chan error, 1)
+	for {
+		select {
+		case block = <-readCh:
+			go func() {
+				startTime := time.Now()
+				errCh <- send(r, block)
+				remoteWriteSendDurationSeconds.Observe(time.Since(startTime).Seconds())
+			}()
+
+			select {
+			case err := <-errCh:
+				if err != nil && errors.Is(err, netWorkConnectErr) {
+					r.queue.MustWriteBlock(block)
+				}
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func limitSeriesCardinality(metric string, h uint64) bool {
@@ -449,11 +587,11 @@ func consumer(ctx context.Context, wg *sync.WaitGroup, i int, r *remote) {
 		if len(r.containers[shard]) == 0 {
 			return
 		}
-		slog.Warn("consumer shard report series",
-			slog.Int("consumer", i),
-			slog.Int("shard", shard),
-			slog.Int("seriesLens", len(r.containers[shard])),
-		)
+		//slog.Warn("consumer shard report series",
+		//	slog.Int("consumer", i),
+		//	slog.Int("shard", shard),
+		//	slog.Int("seriesLens", len(r.containers[shard])),
+		//)
 		defer func() {
 			// re-slice
 			r.containers[shard] = r.containers[shard][:0]
@@ -493,8 +631,21 @@ func consumer(ctx context.Context, wg *sync.WaitGroup, i int, r *remote) {
 			return
 		}
 
+		// persistent local
+		if persistentQueue {
+			r.queue.MustWriteBlock(snappy.Encode(bb.B[:cap(bb.B)], marshal))
+			return
+		}
+
 		// remote send
-		go send(r, snappy.Encode(bb.B[:cap(bb.B)], marshal))
+		go func() {
+			startTime := time.Now()
+			if err = send(r, snappy.Encode(bb.B[:cap(bb.B)], marshal)); err != nil {
+				slog.Error("remote send series failed", slog.String("error", err.Error()))
+			}
+			remoteWriteSendDurationSeconds.Observe(time.Since(startTime).Seconds())
+		}()
+
 	}
 
 	wg.Add(r.shard)
@@ -529,6 +680,7 @@ func retryWithBackOff(retry int, minWait, timeout time.Duration) *http.Client {
 	retryClient := retryablehttp.NewClient()
 	retryClient.RetryMax = retry
 	retryClient.RetryWaitMin = minWait
+	retryClient.RetryWaitMax = timeout
 	retryClient.HTTPClient.Timeout = timeout
 	retryClient.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
 		if err != nil {
@@ -550,13 +702,18 @@ func retryWithBackOff(retry int, minWait, timeout time.Duration) *http.Client {
 	return retryClient.StandardClient()
 }
 
-func send(r *remote, req []byte) {
+var (
+	netWorkConnectErr = errors.New("network connect error")
+	otherErr          = errors.New("other error")
+)
+
+func send(r *remote, req []byte) error {
 	httpReq, err := http.NewRequest("POST", r.addr, bytes.NewReader(req))
 	if err != nil {
-		return
+		return otherErr
 	}
 
-	httpReq.Header.Add("Content-Encoding", "snappy")
+	httpReq.Header.Set("Content-Encoding", "snappy")
 	httpReq.Header.Set("Content-Type", "application/x-protobuf")
 	httpReq.Header.Set("User-Agent", "prom-remote-write-shard")
 	httpReq.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
@@ -564,15 +721,18 @@ func send(r *remote, req []byte) {
 	resp, err := r.api.Do(httpReq)
 	if err != nil {
 		slog.Error("http do failed", slog.String("error", err.Error()))
-		return
+		return netWorkConnectErr
 	}
 	defer clean(resp)
 
 	if resp.StatusCode >= 400 {
 		all, _ := io.ReadAll(resp.Body)
-		slog.Error("api do status code >= 400", slog.Int("code", resp.StatusCode), slog.String("resp", string(all)))
-		return
+		slog.Error("api do status code >= 400", slog.Int("code", resp.StatusCode), slog.Int("req-size", len(req)), slog.String("resp", string(all)))
+		return otherErr
 	}
+
+	slog.Warn("api do success", slog.Int("code", resp.StatusCode), slog.Int("req-size", len(req)))
+	return nil
 }
 
 func clean(resp *http.Response) {
