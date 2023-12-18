@@ -422,19 +422,19 @@ func main() {
 		getLabelsHash := func(lbs []prompb.Label) uint64 {
 			bb := bufPool.Get()
 			b := bb.B[:0]
+
 			for _, label := range lbs {
-				name, value := label.GetName(), label.GetValue()
-				if name == labels.MetricName {
-					metricName = value
+				if label.GetName() == labels.MetricName {
+					metricName = label.GetValue()
 				}
 
-				b = append(b, label.Name...)
-				b = append(b, label.Value...)
+				b = append(b, label.GetName()...)
+				b = append(b, label.GetValue()...)
 			}
-			h := xxhash.Sum64(b)
+
 			bb.B = b
 			bufPool.Put(bb)
-			return h
+			return xxhash.Sum64(b)
 		}
 
 		for i := 0; i < len(req.Timeseries); i++ {
